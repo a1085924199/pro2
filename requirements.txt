@@ -1,0 +1,9 @@
+paddlepaddle==3.2.0
+paddleocr==3.4.0
+paddlex[ocr]==3.4.2
+PyQt5
+opencv-python
+numpy
+requests
+openpyxl
+Pillow

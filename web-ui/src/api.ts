@@ -1,0 +1,149 @@
+import axios from 'axios'
+
+// 开发时 Vite 代理 /api -> http://localhost:8000
+// 生产时同域部署，直接访问
+const BASE = '/api'
+
+// 用于文件下载的实例（绕过 Vite 代理，直接请求后端）
+const DOWNLOAD_BASE = 'http://localhost:8000/api'
+
+export const api = axios.create({
+  baseURL: BASE,
+  timeout: 60000, // 普通请求 60s
+})
+
+// OCR 专用实例：模型首次加载可能需要数分钟
+export const ocrApi = axios.create({
+  baseURL: BASE,
+  timeout: 600000, // 10 分钟，覆盖模型冷启动场景
+})
+
+// ─── 类型定义 ────────────────────────────────────────────────
+export interface FieldResult {
+  key: string
+  field: string
+  value: string
+  confidence: number
+}
+
+export interface OcrResponse {
+  success: boolean
+  fields: FieldResult[]
+  ocr_count: number
+  timestamp: string
+  raw_text?: string
+  table_html?: string
+}
+
+// ─── 健康检查 ────────────────────────────────────────────────
+export async function checkHealth(): Promise<{ status: string }> {
+  const res = await api.get('/health')
+  return res.data
+}
+
+// ─── 调修单 OCR ──────────────────────────────────────────────
+export async function ocrRepairOrder(
+  file: File,
+  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string },
+): Promise<OcrResponse> {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
+  form.append('api_url',  opts?.apiUrl  ?? '')
+  form.append('api_key',  opts?.apiKey  ?? '')
+  form.append('appid',    opts?.appid   ?? '')
+  const res = await ocrApi.post('/ocr/repair-order', form)
+  return res.data
+}
+
+// ─── FastGPT 配置 ────────────────────────────────────────────
+export interface StepFastgptConfig {
+  api_url: string
+  api_key: string
+  appid: string
+  enabled: boolean
+}
+
+export interface FastgptConfig {
+  repair_order_ocr: StepFastgptConfig
+  repair_card_ocr:  StepFastgptConfig
+  ids_match:        StepFastgptConfig
+  quote_generation: StepFastgptConfig
+}
+
+export async function getFastgptConfig(): Promise<FastgptConfig> {
+  const res = await api.get('/config/fastgpt')
+  return res.data
+}
+
+export async function saveFastgptConfig(cfg: FastgptConfig): Promise<{ success: boolean }> {
+  const res = await api.post('/config/fastgpt', cfg)
+  return res.data
+}
+
+// ─── 返修卡 OCR ──────────────────────────────────────────────
+export async function ocrRepairCard(
+  file: File,
+  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string },
+): Promise<OcrResponse> {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
+  form.append('api_url',  opts?.apiUrl  ?? '')
+  form.append('api_key',  opts?.apiKey  ?? '')
+  form.append('appid',    opts?.appid   ?? '')
+  const res = await ocrApi.post('/ocr/repair-card', form)
+  return res.data
+}
+
+// ─── 航材出入库单 OCR ─────────────────────────────────────────
+export async function ocrMaterial(
+  file: File,
+  docType: 'out' | 'in',
+): Promise<OcrResponse> {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('doc_type', docType)
+  const res = await ocrApi.post('/ocr/material', form)
+  return res.data
+}
+
+// ─── 通用 OCR ────────────────────────────────────────────────
+export async function ocrGeneral(
+  file: File,
+  mode: 'doc' | 'table',
+  exportFormat: 'none' | 'excel' | 'csv' | 'markdown' | 'html' | 'json' | 'all' = 'none',
+): Promise<OcrResponse & { exports?: Record<string, string> }> {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('mode', mode)
+  form.append('export_format', exportFormat)
+  const res = await ocrApi.post('/ocr/general', form)
+  return res.data
+}
+
+// ─── 导出文件下载 ────────────────────────────────────────────
+export interface ExportFile {
+  name: string
+  size: number
+  modified: string
+}
+
+export async function listExportFiles(): Promise<{ files: ExportFile[] }> {
+  const res = await api.get('/export/list')
+  return res.data
+}
+
+/**
+ * 下载指定文件名的导出结果
+ * @param filename 后端 output 目录下的文件名
+ */
+export function downloadExportFile(filename: string): void {
+  const url = `${DOWNLOAD_BASE}/export/download?filename=${encodeURIComponent(filename)}`
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+}

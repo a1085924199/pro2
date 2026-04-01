@@ -1,0 +1,36 @@
+# 编译输出
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.spec.bak
+
+# 本地模型（体积过大，不纳入版本控制）
+models/
+
+# 敏感配置（含API Key，不上传）
+config.json
+
+# 测试图片
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+
+# 识别结果输出
+*.json
+!config.json.example
+*.csv
+*.xlsx
+
+# PyInstaller
+*.manifest
+*.spec.log
+
+# IDE
+.vscode/
+.idea/
