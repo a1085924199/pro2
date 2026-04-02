@@ -4,8 +4,9 @@ import axios from 'axios'
 // 生产时同域部署，直接访问
 const BASE = '/api'
 
-// 用于文件下载的实例（绕过 Vite 代理，直接请求后端）
-const DOWNLOAD_BASE = 'http://localhost:8000/api'
+// 与 vite 代理、server 端口一致（默认 8001，见 web-ui/.env.development 的 VITE_API_PORT）
+const API_PORT = import.meta.env.VITE_API_PORT || '8001'
+const DOWNLOAD_BASE = `http://127.0.0.1:${API_PORT}/api`
 
 export const api = axios.create({
   baseURL: BASE,
@@ -57,6 +58,35 @@ export async function ocrRepairOrder(
   form.append('api_key',  opts?.apiKey  ?? '')
   form.append('appid',    opts?.appid   ?? '')
   const res = await ocrApi.post('/ocr/repair-order', form)
+  return res.data
+}
+
+// ─── 调修单结果导出 ──────────────────────────────────────────
+export interface ExportRepairOrderOpts {
+  /** repair_order：横向模板 + 原图；repair_card：两列表格 */
+  docType?: 'repair_order' | 'repair_card'
+  /** 原图文件，Excel 嵌入 J 列缩略图 */
+  imageFile?: File
+  /** 对应「图片名称」列 */
+  imageName?: string
+  /** 对应「识别时间」列，缺省由后端填当前时间 */
+  recognitionTime?: string
+}
+
+export async function exportRepairOrder(
+  fields: Array<{key: string; field: string; value: string; confidence: number}>,
+  fmt: 'excel' | 'csv' | 'json' | 'all' = 'excel',
+  opts?: ExportRepairOrderOpts,
+): Promise<{ success: boolean; exports: Record<string, string>; timestamp: string }> {
+  const form = new FormData()
+  form.append('fields_json', JSON.stringify(fields))
+  form.append('fmt', fmt)
+  form.append('doc_type', opts?.docType ?? 'repair_order')
+  if (opts?.imageName) form.append('image_name', opts.imageName)
+  if (opts?.recognitionTime) form.append('recognition_time', opts.recognitionTime)
+  if (opts?.imageFile) form.append('original_image', opts.imageFile)
+  const client = opts?.imageFile ? ocrApi : api
+  const res = await client.post('/ocr/repair-order/export', form)
   return res.data
 }
 

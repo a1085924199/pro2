@@ -14,14 +14,30 @@ ocr_core.py - OCR 核心处理模块 v7.0
   MaterialParser         - 航材出入库单专用解析器
 """
 import os
+import sys
 import json
 import re
 import cv2
 import numpy as np
 import requests
 import threading
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+
+# Windows 控制台强制 UTF-8 输出（chcp 65001 的等效 Python 设置）
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
+
+def _log(msg: str, flush: bool = True):
+    """带时间戳的日志输出（UTF-8 输出，已在模块顶层配置 stdout）"""
+    ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    print(f"[{ts}] {msg}", flush=flush)
+    sys.stdout.flush()
 
 os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
 
@@ -86,35 +102,44 @@ class PPStructureV3Pool:
                 self._init_failed = True
                 raise RuntimeError('PPStructureV3 不可用，请执行: pip install -U paddleocr')
             try:
-                print('[PPStructureV3] 正在初始化 PPStructureV3 主引擎...')
+                print('[PPStructureV3] 正在初始化 PPStructureV3 主引擎...', flush=True)
                 import paddle
+                _log('[PPStructureV3] PaddlePaddle 已加载')
+                _log('[PPStructureV3] 正在配置推理设备...')
                 # 尝试使用 GPU 加速，如果不可用则回退到 CPU
+                device = 'cpu'
                 try:
                     paddle.device.set_device('gpu')
                     device = 'gpu'
-                    print('[PPStructureV3] 使用 GPU 加速')
-                except Exception:
-                    paddle.device.set_device('cpu')
-                    device = 'cpu'
-                    print('[PPStructureV3] GPU 不可用，使用 CPU')
+                    _log('[PPStructureV3] 检测到 GPU，将使用 GPU 加速推理')
+                    try:
+                        gpu_info = paddle.device.cuda.device_count()
+                        _log(f'[PPStructureV3] 可用 GPU 数量: {gpu_info}')
+                    except Exception:
+                        pass
+                except Exception as e:
+                    _log(f'[PPStructureV3] GPU 不可用，将使用 CPU 推理: {e}')
                 
+                _log('[PPStructureV3] 正在加载 PP-OCRv5 检测模型...')
+                t0 = time.time()
                 self._engine = PPStructureV3(
                     text_detection_model_dir=DET_MODEL_DIR,
                     text_recognition_model_dir=REC_MODEL_DIR,
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_table_recognition=True,
-                    use_textline_orientation=True,
-                    use_seal_recognition=False,
-                    use_formula_recognition=False,
-                    use_chart_recognition=False,
+                    use_doc_orientation_classify=False,   # 关闭文档方向分类
+                    use_doc_unwarping=False,              # 关闭文档去扭曲
+                    use_table_recognition=True,           # 表格识别（调修单需要）
+                    use_textline_orientation=False,       # 关闭文本方向分类（调修单通常方向固定）
+                    use_seal_recognition=False,           # 关闭印章识别
+                    use_formula_recognition=False,         # 关闭公式识别
+                    use_chart_recognition=False,          # 关闭图表识别
                     device=device,
                 )
+                _log(f'[PPStructureV3] ✓ 引擎初始化完成，耗时 {time.time()-t0:.1f}s')
                 self._ready = True
-                print('[PPStructureV3] PPStructureV3 主引擎启动成功')
+                print('[PPStructureV3] PPStructureV3 主引擎启动成功', flush=True)
             except Exception as e:
-                print(f'[PPStructureV3] 引擎初始化失败: {e}')
-                print('[PPStructureV3]   将自动降级为 PaddleOCR 引擎处理所有任务')
+                _log(f'[PPStructureV3] ✗ 引擎初始化失败: {e}')
+                _log('[PPStructureV3]   将自动降级为 PaddleOCR 引擎处理所有任务')
                 self._engine = None
                 # 标记已尝试初始化，避免重复触发
                 self._ready = False
@@ -147,9 +172,9 @@ class PPStructureV3Pool:
                     # 执行一次预测
                     list(self._engine.predict(test_img, use_table_recognition=False))
                     self._warmup_done = True
-                    print('[PPStructureV3] 引擎预热完成')
+                    _log('[PPStructureV3] ✓ 引擎预热完成，模型已就绪')
             except Exception as e:
-                print(f'[PPStructureV3] 预加载失败（不影响服务运行）: {e}')
+                _log(f'[PPStructureV3] ⚠ 预加载失败（不影响服务运行）: {e}')
         threading.Thread(target=_load, daemon=True).start()
 
     @property
@@ -171,15 +196,18 @@ v3_pool = PPStructureV3Pool()
 
 def preprocess_image(image_path: str) -> np.ndarray:
     """读取图像并缩放，宽度上限 1600px，返回 BGR ndarray。"""
-    # 使用更快的图像读取方式
+    _log(f'[预处理] 正在读取图像: {image_path}')
     img = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError(f'无法读取图像: {image_path}')
     h, w = img.shape[:2]
+    _log(f'[预处理] 原始图像尺寸: {w}x{h}')
     MAX_W = 1600
     if w > MAX_W:
-        # 使用更快的插值方法
         img = cv2.resize(img, (MAX_W, int(h * MAX_W / w)), interpolation=cv2.INTER_LINEAR)
+        _log(f'[预处理] 图像已缩放至宽度 {MAX_W}px')
+    else:
+        _log(f'[预处理] 图像无需缩放')
     return img
 
 
@@ -192,7 +220,10 @@ def run_ocr(image_path: str) -> List[Dict]:
     if engine is None:
         raise RuntimeError('PPStructureV3 引擎不可用，无法执行 OCR')
     img_bgr = preprocess_image(image_path)
+    _log('[OCR] 正在进行文本识别...')
+    t0 = time.time()
     results = list(engine.predict(img_bgr))
+    _log(f'[OCR] 文本识别完成，耗时 {time.time()-t0:.1f}s')
     return _extract_texts_from_results(results)
 
 
@@ -423,21 +454,26 @@ class DocParser:
             if not v3_pool.available:
                 raise RuntimeError('PPStructureV3 不可用，使用降级引擎')
             engine = v3_pool.get()
+            _log(f'[DocParser] 开始 PPStructureV3 推理，图像尺寸: {img_bgr.shape[1]}x{img_bgr.shape[0]}')
+            t0 = time.time()
             results = list(engine.predict(img_bgr))
+            _log(f'[DocParser] ✓ PPStructureV3 推理完成，耗时 {time.time()-t0:.1f}s，结果数量: {len(results)}')
             
             # 使用 Result 对象的方法保存表格数据
             for res in results:
                 res.save_to_html(save_path=os.path.join(output_dir, f"{base_name}_table.html"))
                 res.save_to_xlsx(save_path=xlsx_path)
+            _log(f'[DocParser] 已保存 HTML/Excel 表格文件')
             
             parsed = _parse_v3_result(results, img_bgr.shape[:2], xlsx_path=xlsx_path)
             ocr_results = parsed['ocr_results']
             table_regions = parsed['table_regions']
+            _log(f'[DocParser] 解析完成，文本块: {len(ocr_results)} 个，表格区域: {len(table_regions)} 个')
         except Exception as e:
-            print(f'[DocParser] PPStructureV3 失败，使用纯 OCR 降级: {e}')
+            _log(f'[DocParser] ⚠ PPStructureV3 失败，使用纯 OCR 降级: {e}')
             ocr_results = run_ocr(image_path)
             table_regions = []
-            print(f'[DocParser] 降级 OCR 完成，识别到 {len(ocr_results)} 个文本块')
+            _log(f'[DocParser] ✓ 降级 OCR 完成，识别到 {len(ocr_results)} 个文本块')
 
         # 表格结构化
         if table_regions:
@@ -638,6 +674,11 @@ class OCRPipeline:
                 - fastgpt_config: FastGPT 配置
                 - output_dir: 输出目录
         """
+        t_start = time.time()
+        _log(f'[OCRPipeline] ========== 开始处理 ==========')
+        _log(f'[OCRPipeline] 任务类型: {task_type.value}')
+        _log(f'[OCRPipeline] 输入文件: {image_path}')
+        
         output_dir = kwargs.get('output_dir', 'output')
         os.makedirs(output_dir, exist_ok=True)
 
@@ -649,27 +690,64 @@ class OCRPipeline:
         xlsx_path = os.path.join(output_dir, f"{base_name}_table.xlsx")
 
         # 初始化引擎
+        _log(f'[OCRPipeline] 正在获取 PPStructureV3 引擎...')
         engine = v3_pool.get()
         if engine is None:
             raise RuntimeError('PPStructureV3 引擎不可用')
 
-        # 执行推理
+        # 预处理图像
+        _log(f'[OCRPipeline] 正在进行图像预处理...')
         img_bgr = preprocess_image(image_path)
-        results = list(engine.predict(img_bgr))
+        h, w = img_bgr.shape[:2]
+        _log(f'[OCRPipeline] 预处理完成，图像尺寸: {w}x{h}')
 
-        # 使用 Result 对象的内置方法保存结果（参考 test_ppstructurev3_seal.py）
+        # 执行推理 - 分阶段计时
+        _log(f'[OCRPipeline] >>> 阶段 1/5: 正在执行 PPStructureV3 推理...')
+        t_stage = time.time()
+        
+        # 文本检测 + 识别（最耗时阶段）
+        _log(f'[OCRPipeline]   - 正在调用 engine.predict()...')
+        t0 = time.time()
+        sys.stdout.flush()
+        results = list(engine.predict(img_bgr))
+        t_det_rec = time.time() - t0
+        _log(f'[OCRPipeline]   - 文本检测+识别完成，耗时 {t_det_rec:.1f}s')
+        
+        # 表格结构识别（可选，在 engine.predict 中已完成）
+        t_html = time.time()
+        html_count = 0
+        for res in results:
+            if hasattr(res, 'html') and res.html:
+                html_count += 1
+        t_html = time.time() - t_html
+        _log(f'[OCRPipeline]   - HTML 表格提取完成，耗时 {t_html:.1f}s，检测到 {html_count} 个表格区域')
+        
+        t_ocr = time.time() - t_stage
+        _log(f'[OCRPipeline] ✓ 阶段 1/5 完成，总耗时 {t_ocr:.1f}s（检测+识别: {t_det_rec:.1f}s，表格解析: {t_html:.1f}s），返回 {len(results)} 个结果')
+
+        # 保存结果文件
+        _log(f'[OCRPipeline] >>> 阶段 2/5: 正在保存识别结果文件（JSON/MD/HTML/Excel）...')
+        t0 = time.time()
         for res in results:
             res.save_to_json(save_path=json_path)
             res.save_to_markdown(save_path=md_path)
             res.save_to_html(save_path=html_path)
             res.save_to_xlsx(save_path=xlsx_path)
+        _log(f'[OCRPipeline] ✓ 阶段 2/5 完成，耗时 {time.time()-t0:.1f}s')
 
         # 解析结果获取文本和表格数据
+        _log(f'[OCRPipeline] >>> 阶段 3/5: 正在解析推理结果...')
+        t0 = time.time()
         parsed = _parse_v3_result(results, img_bgr.shape[:2], xlsx_path=xlsx_path)
         ocr_results = parsed['ocr_results']
         table_regions = parsed['table_regions']
+        _log(f'[OCRPipeline] ✓ 阶段 3/5 完成，耗时 {time.time()-t0:.1f}s')
+        _log(f'[OCRPipeline]   - 文本块数量: {len(ocr_results)}')
+        _log(f'[OCRPipeline]   - 表格区域数量: {len(table_regions)}')
 
         # 提取表格结构信息
+        _log(f'[OCRPipeline] >>> 阶段 4/5: 正在构建表格结构...')
+        t0 = time.time()
         table = {
             'table_idx': 0,
             'html': '',
@@ -687,9 +765,14 @@ class OCRPipeline:
                 'num_rows': max((c['row'] for c in table_regions[0].get('cells', [])), default=0) + 1,
                 'num_cols': max((c['col'] for c in table_regions[0].get('cells', [])), default=0) + 1,
             }
+            _log(f'[OCRPipeline]   使用表格区域，{table["num_rows"]} 行 x {table["num_cols"]} 列')
         elif ocr_results:
             # 如果没有检测到表格区域，使用备用方案
             table = build_table_structure(ocr_results)
+            _log(f'[OCRPipeline]   使用几何推断构建表格，{table["num_rows"]} 行 x {table["num_cols"]} 列')
+        else:
+            _log(f'[OCRPipeline]   ⚠ 未检测到表格结构')
+        _log(f'[OCRPipeline] ✓ 阶段 4/5 完成，耗时 {time.time()-t0:.1f}s')
 
         # 当 ocr_results 为空但 table_regions 有 cells 时，从 cells 重建 ocr_results
         # 这样字段解析器（RepairOrderParser 等）仍能正常工作
@@ -707,6 +790,8 @@ class OCRPipeline:
                     })
 
         # 根据任务类型选择解析器并提取字段
+        _log(f'[OCRPipeline] >>> 阶段 5/5: 正在提取字段信息...')
+        t0 = time.time()
         extracted_fields = {}
         if task_type != OCRTask.GENERAL:
             parser_map = {
@@ -717,9 +802,12 @@ class OCRPipeline:
             parser = parser_map.get(task_type, DocParser())
 
             if kwargs.get('use_fastgpt') and kwargs.get('fastgpt_config'):
+                _log(f'[OCRPipeline]   正在使用 FastGPT 增强字段提取...')
                 extracted_fields = parser._extract_fastgpt(ocr_results, kwargs.get('fastgpt_config'))
             else:
                 extracted_fields = parser.extract_fields(ocr_results)
+            _log(f'[OCRPipeline]   字段提取完成: {extracted_fields}')
+        _log(f'[OCRPipeline] ✓ 阶段 5/5 完成，耗时 {time.time()-t0:.1f}s')
 
         # 构建返回结果
         result = {
@@ -735,15 +823,19 @@ class OCRPipeline:
         }
 
         # 保存解析结果（包含提取的字段信息）
+        _log(f'[OCRPipeline] 正在保存最终 JSON 结果...')
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
-        print(f"[SUCCESS] 识别完成！结果已保存至：{output_dir}")
-        print("[INFO] 生成的文件：")
-        print(f"  - {base_name}.json (完整识别结果)")
-        print(f"  - {base_name}.md (Markdown结果)")
-        print(f"  - {base_name}_table.html (表格HTML)")
-        print(f"  - {base_name}_table.xlsx (表格Excel)")
+        total_time = time.time() - t_start
+        _log(f'')
+        _log(f'[SUCCESS] ✓ 识别完成！总计耗时 {total_time:.1f}s')
+        _log(f'[INFO] 生成的文件：')
+        _log(f'  - {os.path.basename(json_path)} (完整识别结果)')
+        _log(f'  - {os.path.basename(md_path)} (Markdown结果)')
+        _log(f'  - {os.path.basename(html_path)} (表格HTML)')
+        _log(f'  - {os.path.basename(xlsx_path)} (表格Excel)')
+        _log(f'[OCRPipeline] ========== 处理结束 ==========')
 
         return result
 

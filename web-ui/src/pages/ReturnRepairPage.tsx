@@ -10,6 +10,7 @@ import {
   SettingOutlined,
   SaveOutlined,
   ThunderboltOutlined,
+  DownloadOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import UploadZone from '../components/UploadZone'
@@ -17,8 +18,10 @@ import ResultTable from '../components/ResultTable'
 import {
   ocrRepairOrder,
   ocrRepairCard,
+  exportRepairOrder,
   getFastgptConfig,
   saveFastgptConfig,
+  downloadExportFile,
   type FieldResult,
   type FastgptConfig,
   type StepFastgptConfig,
@@ -36,8 +39,15 @@ interface StepState {
   files:   File[]
   results: FieldResult[]
   info:    string
+  progress_detail?: string  // 新增：详细进度描述
+  cachedFields?: FieldResult[]  // 缓存识别结果，供导出使用
+  /** OCR 返回的识别时间，写入导出表「识别时间」列 */
+  recognizedAt?: string
 }
-const initState = (): StepState => ({ status: 'idle', files: [], results: [], info: '' })
+
+function initState(): StepState {
+  return { status: 'idle', files: [], results: [], info: '', progress_detail: '', cachedFields: undefined, recognizedAt: undefined }
+}
 
 const EMPTY_FGPT: StepFastgptConfig = { api_url: '', api_key: '', appid: '', enabled: false }
 const DEFAULT_CFG: FastgptConfig = {
@@ -147,16 +157,40 @@ export default function ReturnRepairPage() {
     }
   }
 
+  // 模拟详细进度动画
+  const animateProgress = (idx: number, steps: string[]) => {
+    let stepIdx = 0
+    const interval = setInterval(() => {
+      if (stepIdx < steps.length) {
+        updateStep(idx, { progress_detail: steps[stepIdx] })
+        stepIdx++
+      } else {
+        clearInterval(interval)
+      }
+    }, 800)
+    return interval
+  }
+
   const handleProcess = async (idx: number) => {
     if (idx === 2 || idx === 3) {
-      updateStep(idx, { status: 'processing' })
+      updateStep(idx, { status: 'processing', progress_detail: '正在连接 IDS 系统...' })
+      const progressSteps = idx === 2
+        ? ['正在连接 IDS 系统...', '正在获取设备信息...', '正在匹配置信度计算...', '匹配完成']
+        : ['正在汇总数据...', '正在生成报价...', '正在计算费用明细...', '报价生成完成']
+      const interval = animateProgress(idx, progressSteps)
       await new Promise((r) => setTimeout(r, 1200))
-      updateStep(idx, { status: 'done', results: idx === 2 ? IDS_MOCK : QUOTE_MOCK, info: '' })
+      clearInterval(interval)
+      updateStep(idx, { status: 'done', results: idx === 2 ? IDS_MOCK : QUOTE_MOCK, info: '', progress_detail: '' })
       return
     }
     const state = stepStates[idx]
     if (state.files.length === 0) { messageApi.warning('请先上传图片文件'); return }
-    updateStep(idx, { status: 'processing' })
+    updateStep(idx, { status: 'processing', progress_detail: '正在准备识别...' })
+    
+    // 启动进度动画
+    const progressSteps = ['正在加载 OCR 引擎...', '正在进行文本检测...', '正在进行文本识别...', '正在提取字段信息...', '正在生成结果...']
+    const interval = animateProgress(idx, progressSteps)
+    
     const sc = fgptCfg[STEPS[idx].key]
     const opts = sc.enabled
       ? { useFastgpt: true, apiUrl: sc.api_url, apiKey: sc.api_key, appid: sc.appid }
@@ -165,12 +199,58 @@ export default function ReturnRepairPage() {
       const resp = idx === 0
         ? await ocrRepairOrder(state.files[0], opts)
         : await ocrRepairCard(state.files[0], opts)
-      updateStep(idx, { status: 'done', results: resp.fields, info: `识别 ${resp.ocr_count} 个文本块 · ${resp.timestamp}` })
+      clearInterval(interval)
+      updateStep(idx, {
+        status: 'done',
+        results: resp.fields,
+        cachedFields: resp.fields,
+        recognizedAt: resp.timestamp,
+        info: `识别 ${resp.ocr_count} 个文本块 · ${resp.timestamp}`,
+        progress_detail: '',
+      })
       messageApi.success(`步骤 ${idx + 1} 识别完成`)
     } catch (e: unknown) {
+      clearInterval(interval)
       const msg = e instanceof Error ? e.message : String(e)
-      updateStep(idx, { status: 'error', info: msg })
+      updateStep(idx, { status: 'error', info: msg, progress_detail: '' })
       messageApi.error(`识别失败：${msg}`)
+    }
+  }
+
+  // 调修单识别结果导出
+  const handleExport = async (idx: number, fmt: 'excel' | 'csv' | 'json' | 'all') => {
+    const state = stepStates[idx]
+    const fields = state.cachedFields ?? state.results
+    if (fields.length === 0) {
+      messageApi.warning('没有可导出的识别结果')
+      return
+    }
+    try {
+      const exportOpts =
+        idx === 0
+          ? {
+              docType: 'repair_order' as const,
+              imageFile: state.files[0],
+              imageName: state.files[0]?.name ?? '',
+              recognitionTime: state.recognizedAt ?? '',
+            }
+          : { docType: 'repair_card' as const }
+      const resp = await exportRepairOrder(fields, fmt, exportOpts)
+      const exports = resp.exports ?? {}
+      if (Object.keys(exports).length > 0) {
+        // 依次触发下载
+        for (const [, filePath] of Object.entries(exports)) {
+          const filename = filePath.split(/[\\/]/).pop() || 'export'
+          downloadExportFile(filename)
+          await new Promise((r) => setTimeout(r, 300))
+        }
+        messageApi.success('导出成功')
+      } else {
+        messageApi.warning('未能获取导出文件')
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      messageApi.error(`导出失败：${msg}`)
     }
   }
 
@@ -267,7 +347,18 @@ export default function ReturnRepairPage() {
             {current < 2 && (
               <div className="mb-6">
                 <div style={{ color: '#7d8590', fontSize: 13, marginBottom: 10 }}>上传扫描件图片</div>
-                <UploadZone onFiles={(files) => updateStep(current, { files, status: 'idle', results: [] })} multiple={false} />
+                <UploadZone
+                  onFiles={(files) =>
+                    updateStep(current, {
+                      files,
+                      status: 'idle',
+                      results: [],
+                      cachedFields: undefined,
+                      recognizedAt: undefined,
+                    })
+                  }
+                  multiple={false}
+                />
               </div>
             )}
 
@@ -300,6 +391,37 @@ export default function ReturnRepairPage() {
               >
                 {state.status === 'processing' ? '识别中...' : '开始处理'}
               </Button>
+              {/* 进度详情显示 */}
+              {state.status === 'processing' && state.progress_detail && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    padding: '6px 14px',
+                    borderRadius: 8,
+                    background: `${step.color}12`,
+                    border: `1px solid ${step.color}30`,
+                    color: '#7d8590',
+                    fontSize: 13,
+                  }}
+                >
+                  <motion.div
+                    animate={{ rotate: 360 }}
+                    transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
+                    style={{
+                      width: 14,
+                      height: 14,
+                      border: `2px solid ${step.color}50`,
+                      borderTopColor: step.color,
+                      borderRadius: '50%',
+                    }}
+                  />
+                  {state.progress_detail}
+                </motion.div>
+              )}
               {state.status === 'done' && current < STEPS.length - 1 && (
                 <Button onClick={() => setCurrent(current + 1)}
                   style={{ background: '#1c2128', borderColor: '#30363d', color: '#e6edf3' }}>
@@ -314,7 +436,39 @@ export default function ReturnRepairPage() {
                 <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }}>
                   <Divider style={{ borderColor: '#21262d', margin: '0 0 16px' }} />
                   {state.info && <p style={{ color: '#7d8590', fontSize: 12, marginBottom: 12 }}>{state.info}</p>}
-                  <ResultTable data={state.results} onExport={() => {}} />
+                  {/* 调修单/返修卡专属导出按钮组 */}
+                  {current < 2 && (
+                    <div className="flex gap-2 mb-4">
+                      <Button
+                        size="small"
+                        icon={<DownloadOutlined />}
+                        onClick={() => handleExport(current, 'excel')}
+                        style={{ background: '#1f883d', borderColor: '#1f883d', color: '#fff' }}
+                      >
+                        导出 Excel
+                      </Button>
+                      <Button
+                        size="small"
+                        icon={<DownloadOutlined />}
+                        onClick={() => handleExport(current, 'csv')}
+                        style={{ background: '#1c2128', borderColor: '#30363d', color: '#e6edf3' }}
+                      >
+                        导出 CSV
+                      </Button>
+                      <Button
+                        size="small"
+                        icon={<DownloadOutlined />}
+                        onClick={() => handleExport(current, 'json')}
+                        style={{ background: '#1c2128', borderColor: '#30363d', color: '#e6edf3' }}
+                      >
+                        导出 JSON
+                      </Button>
+                    </div>
+                  )}
+                  <ResultTable
+                    data={state.results}
+                    onExport={current < 2 ? () => handleExport(current, 'excel') : undefined}
+                  />
                 </motion.div>
               )}
             </AnimatePresence>
