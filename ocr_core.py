@@ -222,7 +222,10 @@ def run_ocr(image_path: str) -> List[Dict]:
     img_bgr = preprocess_image(image_path)
     _log('[OCR] 正在进行文本识别...')
     t0 = time.time()
-    results = list(engine.predict(img_bgr))
+    try:
+        results = list(engine.predict(img_bgr, use_table_recognition=False))
+    except TypeError:
+        results = list(engine.predict(img_bgr))
     _log(f'[OCR] 文本识别完成，耗时 {time.time()-t0:.1f}s')
     return _extract_texts_from_results(results)
 
@@ -515,12 +518,12 @@ class DocParser:
     def extract_fields(self, ocr_results: List[Dict], table_regions: List = None) -> Dict[str, str]:
         return {f: '' for f in self.FIELDS}
 
-    def _extract_fastgpt(self, texts: List[Dict], cfg: Dict) -> Dict[str, str]:
+    def _extract_fastgpt(self, texts: List[Dict], cfg: Dict, table_regions=None) -> Dict[str, str]:
         api_url = cfg.get('api_url', '')
         api_key = cfg.get('api_key', '')
         appid   = cfg.get('appid', '')
         if not api_key or not api_url:
-            return self.extract_fields(texts)
+            return self.extract_fields(texts, table_regions)
         try:
             ocr_text   = '\n'.join(t['text'] for t in texts)
             fields_str = '\n'.join(f'  - {f}' for f in self.FIELDS)
@@ -555,7 +558,7 @@ class DocParser:
         except Exception as e:
             print(f'FastGPT调用失败({self.__class__.__name__}): {e}')
         # 超时或解析失败时回退到规则提取（传入完整 OCR 文本供匹配）
-        fallback_fields = self.extract_fields(texts, table_regions=None)
+        fallback_fields = self.extract_fields(texts, table_regions)
         # 再尝试从 OCR 全文补充未填字段
         full_text = '\n'.join(t['text'] for t in texts)
         for fn, val in fallback_fields.items():
@@ -648,11 +651,80 @@ class RepairCardParser(DocParser):
     """
     返修件维修卡字段（与 FastGPT 提示一致）。
     重要：返修卡号优先从表头 NO.xxxx 提取。
+    「返修故障件信息」与「损坏原因、修理结果」为表单上、下两个独立区块，须分别提取，不可混用。
     """
     FIELDS = [
         '返修卡号', '产品代号', '联系人', '顾客单位', '批次号', '电话号',
         '返修件名称', '图号', '返修故障件信息', '损坏原因修理结果', 'FRACAS/排故报告编号',
     ]
+
+    @staticmethod
+    def _clean_fault_section_footer(s: str) -> str:
+        """去掉返修故障件信息段末尾的维修部门、日期等。"""
+        if not s:
+            return ''
+        t = s.strip()
+        t = re.split(r'维修部门\s*[：:]', t)[0].strip()
+        t = re.sub(r'\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*$', '', t).strip()
+        return t
+
+    @staticmethod
+    def _clean_damage_section_tail(s: str) -> str:
+        """去掉损坏原因修理结果段后的 FRACAS、维修人员等。"""
+        if not s:
+            return ''
+        t = s.strip()
+        if 'FRACAS' in t:
+            t = t.split('FRACAS')[0].strip()
+        if '排故报告编号' in t:
+            t = t.split('排故报告编号')[0].strip()
+        if '维修人员' in t:
+            t = re.split(r'维修人员', t)[0].strip()
+        return t.strip()
+
+    @staticmethod
+    def _regex_extract_fault_and_damage(s: str) -> tuple[str, str]:
+        """
+        按标签从全文或单单元格文本中拆分两段。
+        返修故障件信息：……（至「损坏原因」标签前）
+        损坏原因、修理结果：……（至 FRACAS / 排故 / 维修人员 前）
+        """
+        fault, damage = '', ''
+        if not s:
+            return fault, damage
+        s = s.replace('\r', '\n')
+        # 返修故障件信息（必须带标签，避免与下段混淆）
+        mf = re.search(
+            r'返修故障件信息\s*[：:]\s*([\s\S]*?)(?=\s*损坏原因\s*[、,，]?\s*修理结果\s*[：:]|\s*损坏原因\s*[：:])',
+            s,
+        )
+        if not mf:
+            mf = re.search(
+                r'返修故障\s*[：:]\s*([\s\S]*?)(?=\s*损坏原因\s*[、,，]?\s*修理结果|\s*损坏原因\s*[：:])',
+                s,
+            )
+        if mf:
+            fault = RepairCardParser._clean_fault_section_footer(mf.group(1).strip())
+        # 损坏原因、修理结果
+        md = re.search(
+            r'损坏原因\s*[、,，]?\s*修理结果\s*[：:]\s*([\s\S]*?)(?=FRACAS|排故报告编号|维修人员)',
+            s,
+            re.IGNORECASE,
+        )
+        if md:
+            damage = RepairCardParser._clean_damage_section_tail(md.group(1).strip())
+        return fault, damage
+
+    @staticmethod
+    def _collect_table_text_blobs(table_regions) -> list[str]:
+        """所有表格单元格文本，用于分段识别（多格拆行时拼接）。"""
+        blobs: list[str] = []
+        for tr in (table_regions or []):
+            for cell in tr.get('cells', []):
+                ct = (cell.get('text') or '').strip()
+                if ct:
+                    blobs.append(ct)
+        return blobs
 
     def extract_fields(self, ocr_results, table_regions=None):
         fields = {f: '' for f in self.FIELDS}
@@ -714,18 +786,63 @@ class RepairCardParser(DocParser):
             return ''
 
         def _table_fault_block(texts) -> str:
-            """找含「返修故障」关键词的大段文字块（多行合并）"""
+            """从 OCR 行中找「返修故障件信息」段（不得把仅含损坏原因、修理结果的行当作本字段）。"""
             lines = [t['text'].strip() for t in texts]
+            for line in lines:
+                if '返修故障件信息' in line or ('返修故障' in line and '损坏原因' not in line):
+                    f, _ = RepairCardParser._regex_extract_fault_and_damage(line)
+                    if f:
+                        return f[:2000]
+                    # 单行标签+正文无「损坏原因」时，取冒号后至行尾
+                    if '返修故障' in line and '损坏原因' not in line:
+                        for prefix in ('返修故障件信息：', '返修故障件信息:', '返修故障：', '返修故障:'):
+                            if prefix in line:
+                                tail = line.split(prefix, 1)[-1].strip()
+                                if tail:
+                                    return RepairCardParser._clean_fault_section_footer(tail)[:2000]
+            # 多行：从含返修故障件信息的行起收集，遇损坏原因或 FRACAS 则停
             for i, line in enumerate(lines):
-                if '返修故障' in line or '损坏原因' in line:
-                    parts = [line]
-                    for j in range(i + 1, min(i + 8, len(lines))):
-                        lj = lines[j]
-                        if any(k in lj for k in ('FRACAS', '维修人员', '排故报告', '修理结果：', '维修部门')) and j > i:
-                            break
-                        if lj and lj not in ('1', '2', '3', '4', '5'):
-                            parts.append(lj)
-                    return ' '.join(parts)[:2000]
+                if '返修故障件信息' not in line and not ('返修故障' in line and '损坏原因' not in line):
+                    continue
+                parts = [line]
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    lj = lines[j]
+                    if '损坏原因' in lj or 'FRACAS' in lj or '修理结果' in lj:
+                        break
+                    if any(k in lj for k in ('维修部门', '装备部')) and j > i:
+                        parts.append(lj)
+                        break
+                    if lj and lj not in ('1', '2', '3', '4', '5'):
+                        parts.append(lj)
+                blob = ' '.join(parts)
+                f, d = RepairCardParser._regex_extract_fault_and_damage(blob)
+                if f:
+                    return f[:2000]
+                if not d and '返修故障' in blob:
+                    for prefix in ('返修故障件信息：', '返修故障件信息:', '返修故障：', '返修故障:'):
+                        if prefix in blob:
+                            tail = blob.split(prefix, 1)[-1].strip()
+                            if tail and '损坏原因' not in tail:
+                                return RepairCardParser._clean_fault_section_footer(tail)[:2000]
+            return ''
+
+        def _extract_fault_info_from_cell(cell_text: str) -> str:
+            """仅从含「返修故障件信息」的单元格取故障描述；若与损坏原因同格则正则拆分，不取损坏原因段。"""
+            if not cell_text:
+                return ''
+            if '返修故障件信息' in cell_text or ('返修故障' in cell_text and '损坏原因' not in cell_text):
+                f, _ = RepairCardParser._regex_extract_fault_and_damage(cell_text)
+                if f:
+                    return f
+                if '返修故障' in cell_text and '损坏原因' not in cell_text:
+                    for prefix in ('返修故障件信息：', '返修故障件信息:', '返修故障：', '返修故障:'):
+                        if prefix in cell_text:
+                            return RepairCardParser._clean_fault_section_footer(
+                                cell_text.split(prefix, 1)[-1].strip()
+                            )
+            if '返修故障件信息' in cell_text and '损坏原因' in cell_text:
+                f, _ = RepairCardParser._regex_extract_fault_and_damage(cell_text)
+                return f or ''
             return ''
 
         # 逐字段从表格提取
@@ -795,12 +912,105 @@ class RepairCardParser(DocParser):
             else:
                 fields['图号'] = v
 
+        # ── 返修故障件信息 / 损坏原因修理结果：先按标签从全文与表格拆分（两栏独立）──────────
+        fault_best, damage_best = '', ''
+        table_joined = '\n'.join(RepairCardParser._collect_table_text_blobs(table_regions))
+        for blob in (full_text, table_joined):
+            if not blob.strip():
+                continue
+            f, d = RepairCardParser._regex_extract_fault_and_damage(blob)
+            if f and not fault_best:
+                fault_best = f
+            if d and not damage_best:
+                damage_best = d
+            if fault_best and damage_best:
+                break
+        if not fault_best or not damage_best:
+            for ct in RepairCardParser._collect_table_text_blobs(table_regions):
+                if len(ct) < 8:
+                    continue
+                f, d = RepairCardParser._regex_extract_fault_and_damage(ct)
+                if f and not fault_best:
+                    fault_best = f
+                if d and not damage_best:
+                    damage_best = d
+
+        if fault_best:
+            fields['返修故障件信息'] = fault_best
+        if damage_best:
+            fields['损坏原因修理结果'] = damage_best
+
+        # 返修故障件信息：兜底（标签单独成格、或仅出现在 OCR 行）
         if not fields['返修故障件信息']:
-            v = _table_row_value(table_regions, ['返修故障件信息', '返修故障', '故障件信息'])
-            if not v:
+            for tr in (table_regions or []):
+                for cell in tr.get('cells', []):
+                    cell_text = cell.get('text', '').strip()
+                    if not cell_text:
+                        continue
+                    if '返修故障件信息' in cell_text or (
+                        '返修故障' in cell_text and '损坏原因' not in cell_text
+                    ):
+                        v = _extract_fault_info_from_cell(cell_text)
+                        if v:
+                            fields['返修故障件信息'] = v
+                            break
+                if fields['返修故障件信息']:
+                    break
+            if not fields['返修故障件信息']:
+                v = _table_row_value(table_regions, ['返修故障件信息', '返修故障'])
+                if v:
+                    fields['返修故障件信息'] = RepairCardParser._clean_fault_section_footer(v)
+            if not fields['返修故障件信息']:
                 v = _table_fault_block(texts)
-            if v:
-                fields['返修故障件信息'] = v
+                if v:
+                    fields['返修故障件信息'] = v
+
+        # 损坏原因修理结果：兜底（仅当正则未命中时）
+        if not fields['损坏原因修理结果']:
+            for tr in (table_regions or []):
+                for cell in tr.get('cells', []):
+                    cell_text = cell.get('text', '').strip()
+                    if '损坏原因' in cell_text and len(cell_text) > 10:
+                        _, d = RepairCardParser._regex_extract_fault_and_damage(cell_text)
+                        if d:
+                            fields['损坏原因修理结果'] = d
+                            break
+                        if '：' in cell_text:
+                            result = cell_text.split('：', 1)[-1].strip()
+                        elif ':' in cell_text:
+                            result = cell_text.split(':', 1)[-1].strip()
+                        else:
+                            result = cell_text
+                        if 'FRACAS' in result:
+                            result = result.split('FRACAS')[0].strip()
+                        if '排故报告编号' in result:
+                            result = result.split('排故报告编号')[0].strip()
+                        result = RepairCardParser._clean_damage_section_tail(result)
+                        if result:
+                            fields['损坏原因修理结果'] = result
+                            break
+                if fields['损坏原因修理结果']:
+                    break
+            if not fields['损坏原因修理结果']:
+                for item in texts:
+                    t = item.get('text', '').strip()
+                    if '损坏原因' in t or '修理结果' in t:
+                        _, d = RepairCardParser._regex_extract_fault_and_damage(t)
+                        if d:
+                            fields['损坏原因修理结果'] = d
+                            break
+                        if '：' in t:
+                            result = t.split('：', 1)[-1].strip()
+                        elif ':' in t:
+                            result = t.split(':', 1)[-1].strip()
+                        else:
+                            result = t
+                        if 'FRACAS' in result:
+                            result = result.split('FRACAS')[0].strip()
+                        result = RepairCardParser._clean_damage_section_tail(result)
+                        if result:
+                            fields['损坏原因修理结果'] = result
+                            break
 
         if not fields['FRACAS/排故报告编号']:
             m = re.search(r'(FRA[A-Z0-9]{6,})', full_text, re.IGNORECASE)
@@ -864,11 +1074,23 @@ class OCRPipeline:
                 - use_fastgpt: 是否使用 FastGPT 优化
                 - fastgpt_config: FastGPT 配置
                 - output_dir: 输出目录
+                - fast_batch: 为 True 时关闭表格结构识别（predict 使用 use_table_recognition=False），
+                  仅跑文本检测+识别，通常更快；表格区域依赖几何推断 build_table_structure。
+                - skip_structure_artifacts: 为 True 时不落盘 JSON/MD/HTML/原表 xlsx 及最终解析 json（批量场景）。
+                  未指定时若 fast_batch=True 则默认跳过。
         """
         t_start = time.time()
+        fast_batch = bool(kwargs.get('fast_batch', False))
+        skip_artifacts = kwargs.get('skip_structure_artifacts')
+        if skip_artifacts is None:
+            skip_artifacts = fast_batch
+        skip_artifacts = bool(skip_artifacts)
+
         _log(f'[OCRPipeline] ========== 开始处理 ==========')
         _log(f'[OCRPipeline] 任务类型: {task_type.value}')
         _log(f'[OCRPipeline] 输入文件: {image_path}')
+        if fast_batch:
+            _log(f'[OCRPipeline] 快速模式: fast_batch=True（关闭表格结构识别，原表文件不落盘={skip_artifacts}）')
         
         output_dir = kwargs.get('output_dir', 'output')
         os.makedirs(output_dir, exist_ok=True)
@@ -900,7 +1122,13 @@ class OCRPipeline:
         _log(f'[OCRPipeline]   - 正在调用 engine.predict()...')
         t0 = time.time()
         sys.stdout.flush()
-        results = list(engine.predict(img_bgr))
+        if fast_batch:
+            try:
+                results = list(engine.predict(img_bgr, use_table_recognition=False))
+            except TypeError:
+                results = list(engine.predict(img_bgr))
+        else:
+            results = list(engine.predict(img_bgr))
         t_det_rec = time.time() - t0
         _log(f'[OCRPipeline]   - 文本检测+识别完成，耗时 {t_det_rec:.1f}s')
         
@@ -916,15 +1144,18 @@ class OCRPipeline:
         t_ocr = time.time() - t_stage
         _log(f'[OCRPipeline] ✓ 阶段 1/5 完成，总耗时 {t_ocr:.1f}s（检测+识别: {t_det_rec:.1f}s，表格解析: {t_html:.1f}s），返回 {len(results)} 个结果')
 
-        # 保存结果文件
-        _log(f'[OCRPipeline] >>> 阶段 2/5: 正在保存识别结果文件（JSON/MD/HTML/Excel）...')
-        t0 = time.time()
-        for res in results:
-            res.save_to_json(save_path=json_path)
-            res.save_to_markdown(save_path=md_path)
-            res.save_to_html(save_path=html_path)
-            res.save_to_xlsx(save_path=xlsx_path)
-        _log(f'[OCRPipeline] ✓ 阶段 2/5 完成，耗时 {time.time()-t0:.1f}s')
+        # 保存结果文件（批量快速模式跳过，避免原表输出与 IO 开销）
+        if skip_artifacts:
+            _log(f'[OCRPipeline] >>> 阶段 2/5: 已跳过原表 JSON/MD/HTML/XLSX 落盘（快速批量）')
+        else:
+            _log(f'[OCRPipeline] >>> 阶段 2/5: 正在保存识别结果文件（JSON/MD/HTML/Excel）...')
+            t0 = time.time()
+            for res in results:
+                res.save_to_json(save_path=json_path)
+                res.save_to_markdown(save_path=md_path)
+                res.save_to_html(save_path=html_path)
+                res.save_to_xlsx(save_path=xlsx_path)
+            _log(f'[OCRPipeline] ✓ 阶段 2/5 完成，耗时 {time.time()-t0:.1f}s')
 
         # 解析结果获取文本和表格数据
         _log(f'[OCRPipeline] >>> 阶段 3/5: 正在解析推理结果...')
@@ -994,7 +1225,7 @@ class OCRPipeline:
 
             if kwargs.get('use_fastgpt') and kwargs.get('fastgpt_config'):
                 _log(f'[OCRPipeline]   正在使用 FastGPT 增强字段提取...')
-                extracted_fields = parser._extract_fastgpt(ocr_results, kwargs.get('fastgpt_config'))
+                extracted_fields = parser._extract_fastgpt(ocr_results, kwargs.get('fastgpt_config'), table_regions)
             else:
                 extracted_fields = parser.extract_fields(ocr_results, table_regions)
             _log(f'[OCRPipeline]   字段提取完成: {extracted_fields}')
@@ -1011,21 +1242,28 @@ class OCRPipeline:
             'extracted_fields': extracted_fields,
             'summary': f'共识别 {len(ocr_results)} 个文本块，{len(table_regions)} 个表格区域',
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'xlsx_path': '' if skip_artifacts else xlsx_path,
+            'fast_batch': fast_batch,
+            'skip_structure_artifacts': skip_artifacts,
         }
 
         # 保存解析结果（包含提取的字段信息）
-        _log(f'[OCRPipeline] 正在保存最终 JSON 结果...')
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+        if skip_artifacts:
+            _log(f'[OCRPipeline] 已跳过最终 JSON 落盘（快速批量）')
+        else:
+            _log(f'[OCRPipeline] 正在保存最终 JSON 结果...')
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
 
         total_time = time.time() - t_start
         _log(f'')
         _log(f'[SUCCESS] ✓ 识别完成！总计耗时 {total_time:.1f}s')
-        _log(f'[INFO] 生成的文件：')
-        _log(f'  - {os.path.basename(json_path)} (完整识别结果)')
-        _log(f'  - {os.path.basename(md_path)} (Markdown结果)')
-        _log(f'  - {os.path.basename(html_path)} (表格HTML)')
-        _log(f'  - {os.path.basename(xlsx_path)} (表格Excel)')
+        if not skip_artifacts:
+            _log(f'[INFO] 生成的文件：')
+            _log(f'  - {os.path.basename(json_path)} (完整识别结果)')
+            _log(f'  - {os.path.basename(md_path)} (Markdown结果)')
+            _log(f'  - {os.path.basename(html_path)} (表格HTML)')
+            _log(f'  - {os.path.basename(xlsx_path)} (表格Excel)')
         _log(f'[OCRPipeline] ========== 处理结束 ==========')
 
         return result
@@ -1057,7 +1295,7 @@ class RepairOrderOCR:
     def __init__(self):
         pass
 
-    def process_image(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None) -> Dict:
+    def process_image(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None, fast_batch: bool = False) -> Dict:
         """
         处理调修单图像
         """
@@ -1066,10 +1304,12 @@ class RepairOrderOCR:
             task_type=OCRTask.REPAIR_ORDER,
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_config,
-            output_dir=output_dir or 'output'
+            output_dir=output_dir or 'output',
+            fast_batch=fast_batch,
+            skip_structure_artifacts=fast_batch,
         )
 
-    def process_repair_card(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None) -> Dict:
+    def process_repair_card(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None, fast_batch: bool = False) -> Dict:
         """处理返修卡图像（PPStructureV3 + RepairCardParser 字段 + 可选 FastGPT）"""
         from ocr_core import OCRPipeline, OCRTask
         return OCRPipeline.process(
@@ -1077,7 +1317,9 @@ class RepairOrderOCR:
             task_type=OCRTask.REPAIR_CARD,
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_config,
-            output_dir=output_dir or 'output'
+            output_dir=output_dir or 'output',
+            fast_batch=fast_batch,
+            skip_structure_artifacts=fast_batch,
         )
 
     def ocr_recognize(self, image_path: str, output_dir: str = None) -> List[Dict]:

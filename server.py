@@ -341,6 +341,186 @@ def _write_repair_card_excel_template(
             pass
 
 
+def _write_repair_order_excel_batch(path: str, rows: List[dict]) -> None:
+    """
+    调修单批量导出：多行数据，表头与单张导出一致。
+    rows: [{ "image_name", "recognition_time", "field_map": dict, "image_bytes": Optional[bytes] }, ...]
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.utils import get_column_letter
+    from PIL import Image as PILImage
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '调修单'
+
+    headers = [
+        '图片名称', '调修单号', '装备型号', '器材名称', '型（图）号',
+        '器件编号', '邮寄地址', '进厂时间', '识别时间', '原图',
+    ]
+    header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+    header_font = Font(color='FFFFFF', bold=True, size=11)
+    thin = Side(style='thin', color='B4C6E7')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    align = Alignment(vertical='center', wrap_text=True)
+
+    for col, title in enumerate(headers, start=1):
+        c = ws.cell(row=1, column=col, value=title)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.border = border
+
+    col_widths = [14, 22, 18, 14, 16, 14, 28, 12, 20, 18]
+    for i, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    thumb_paths: List[str] = []
+    try:
+        resample = PILImage.Resampling.LANCZOS
+    except AttributeError:
+        resample = PILImage.LANCZOS  # type: ignore[attr-defined]
+
+    for i, row in enumerate(rows):
+        r = i + 2
+        fm = row.get('field_map') or {}
+        row_vals = [
+            row.get('image_name') or '',
+            fm.get('调修单号', ''),
+            fm.get('装备型号', ''),
+            fm.get('器材名称', ''),
+            fm.get('型（图）号', ''),
+            fm.get('器件编号', ''),
+            fm.get('邮寄地址', ''),
+            fm.get('进厂时间', ''),
+            row.get('recognition_time') or '',
+            '',
+        ]
+        for col, val in enumerate(row_vals, start=1):
+            c = ws.cell(row=r, column=col, value=val)
+            c.alignment = align
+            c.border = border
+
+        img_b = row.get('image_bytes')
+        if img_b:
+            try:
+                pil = PILImage.open(BytesIO(img_b))
+                if pil.mode in ('RGBA', 'P'):
+                    pil = pil.convert('RGB')
+                pil.thumbnail((520, 380), resample)
+                tp = tempfile.NamedTemporaryFile(delete=False, suffix='.png').name
+                pil.save(tp, 'PNG')
+                thumb_paths.append(tp)
+                xl_img = XLImage(tp)
+                ws.add_image(xl_img, f'J{r}')
+                ws.row_dimensions[r].height = 220
+            except Exception as e:
+                print(f'[调修单批量导出] 第{i + 1}行嵌入原图失败: {e}', flush=True)
+                ws.row_dimensions[r].height = 28
+        else:
+            ws.row_dimensions[r].height = 28
+
+    wb.save(path)
+    for tp in thumb_paths:
+        try:
+            os.unlink(tp)
+        except OSError:
+            pass
+
+
+def _write_repair_card_excel_batch(path: str, rows: List[dict]) -> None:
+    """返修卡批量导出。rows: [{ image_name, recognition_time, field_map, image_bytes? }, ...]"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.utils import get_column_letter
+    from PIL import Image as PILImage
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '返修卡'
+
+    headers = [
+        '图片名称', '返修卡号', '产品代号', '联系人', '顾客单位', '批次号', '电话号',
+        '返修件名称', '图号', '返修故障件信息', '损坏原因修理结果', 'FRACAS/排故报告编号',
+        '识别时间', '原图',
+    ]
+    header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+    header_font = Font(color='FFFFFF', bold=True, size=10)
+    thin = Side(style='thin', color='B4C6E7')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    align = Alignment(vertical='center', wrap_text=True)
+
+    for col, title in enumerate(headers, start=1):
+        c = ws.cell(row=1, column=col, value=title)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.border = border
+
+    col_widths = [12, 14, 10, 10, 24, 10, 12, 14, 14, 28, 28, 18, 18, 14]
+    for i, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    thumb_paths: List[str] = []
+    try:
+        resample = PILImage.Resampling.LANCZOS
+    except AttributeError:
+        resample = PILImage.LANCZOS  # type: ignore[attr-defined]
+
+    for i, row in enumerate(rows):
+        r = i + 2
+        fm = row.get('field_map') or {}
+        row_vals = [
+            row.get('image_name') or '',
+            fm.get('返修卡号', ''),
+            fm.get('产品代号', ''),
+            fm.get('联系人', ''),
+            fm.get('顾客单位', ''),
+            fm.get('批次号', ''),
+            fm.get('电话号', ''),
+            fm.get('返修件名称', ''),
+            fm.get('图号', ''),
+            fm.get('返修故障件信息', ''),
+            fm.get('损坏原因修理结果', ''),
+            fm.get('FRACAS/排故报告编号', ''),
+            row.get('recognition_time') or '',
+            '',
+        ]
+        for col, val in enumerate(row_vals, start=1):
+            c = ws.cell(row=r, column=col, value=val)
+            c.alignment = align
+            c.border = border
+
+        img_b = row.get('image_bytes')
+        if img_b:
+            try:
+                pil = PILImage.open(BytesIO(img_b))
+                if pil.mode in ('RGBA', 'P'):
+                    pil = pil.convert('RGB')
+                pil.thumbnail((480, 360), resample)
+                tp = tempfile.NamedTemporaryFile(delete=False, suffix='.png').name
+                pil.save(tp, 'PNG')
+                thumb_paths.append(tp)
+                xl_img = XLImage(tp)
+                ws.add_image(xl_img, f'N{r}')
+                ws.row_dimensions[r].height = 200
+            except Exception as e:
+                print(f'[返修卡批量导出] 第{i + 1}行嵌入原图失败: {e}', flush=True)
+                ws.row_dimensions[r].height = 28
+        else:
+            ws.row_dimensions[r].height = 28
+
+    wb.save(path)
+    for tp in thumb_paths:
+        try:
+            os.unlink(tp)
+        except OSError:
+            pass
+
+
 def _field_result(fields: dict, ocr_results: list) -> dict:
     """将提取字段转换为前端 ResultTable 需要的格式"""
     # 计算每个字段值的置信度（取对应 OCR 文本的最大置信度）
@@ -363,7 +543,7 @@ def _field_result(fields: dict, ocr_results: list) -> dict:
 # ─── Config 路径 ────────────────────────────────────────────────────────────────
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-STEP_KEYS = ["repair_order_ocr", "repair_card_ocr", "ids_match", "quote_generation"]
+STEP_KEYS = ["repair_order_ocr", "repair_card_ocr", "archive_generation", "ids_match", "quote_generation"]
 
 DEFAULT_CONFIG = {
     k: {"api_url": "", "api_key": "", "appid": "", "enabled": False}
@@ -643,13 +823,15 @@ async def ocr_pipeline(
 async def ocr_repair_order(
     file: UploadFile = File(...),
     use_fastgpt: bool = Form(False),
+    fast_batch: bool = Form(False),
     api_url:  str = Form(""),
     api_key:  str = Form(""),
     appid:    str = Form(""),
 ):
     """
     调修单 OCR 识别。
-    返回：{ success, fields: [{key,field,value,confidence}], ocr_count, timestamp }
+    fast_batch=True：关闭表格结构识别、不落盘原表文件（JSON/HTML/表格xlsx），通常更快。
+    返回：{ success, fields, ocr_count, timestamp, raw_exports, fastgpt_used, fast_batch }
     """
     from datetime import datetime as dt
     import sys
@@ -677,7 +859,13 @@ async def ocr_repair_order(
         fastgpt_cfg = {"api_url": api_url, "api_key": api_key, "appid": appid} if use_fastgpt else None
         _log(f'开始执行调修单识别...')
         t0 = dt.now()
-        result = processor.process_image(tmp_path, use_fastgpt=use_fastgpt, fastgpt_config=fastgpt_cfg, output_dir=session_dir)
+        result = processor.process_image(
+            tmp_path,
+            use_fastgpt=use_fastgpt,
+            fastgpt_config=fastgpt_cfg,
+            output_dir=session_dir,
+            fast_batch=fast_batch,
+        )
         elapsed = (dt.now() - t0).total_seconds()
 
         # 记录字段提取来源
@@ -686,14 +874,16 @@ async def ocr_repair_order(
         _log(f'✓ 识别完成，耗时 {elapsed:.1f}s')
         _log(f'  - 文本块: {len(result["ocr_results"])} 个')
         _log(f'  - FastGPT 启用: {fastgpt_enabled}')
+        _log(f'  - fast_batch: {fast_batch}')
         _log(f'  - 提取字段: {extracted_fields}')
 
         fields_list = _field_result(extracted_fields, result["ocr_results"])
 
-        # 构建原始表格文件路径（PPStructureV3 输出的 JSON 和 HTML）
+        # 构建原始表格文件路径（PPStructureV3 输出的 JSON/HTML/Excel）
         base_name = os.path.splitext(os.path.basename(tmp_path))[0]
         raw_json_path = os.path.join(session_dir, f"{base_name}.json")
         raw_html_path = os.path.join(session_dir, f"{base_name}_table.html")
+        xlsx_raw = (result.get("xlsx_path") or "").strip()
 
         return {
             "success":   True,
@@ -704,9 +894,11 @@ async def ocr_repair_order(
             "raw_exports": {
                 "json": raw_json_path if os.path.exists(raw_json_path) else None,
                 "html": raw_html_path if os.path.exists(raw_html_path) else None,
+                "xlsx": xlsx_raw if xlsx_raw and os.path.exists(xlsx_raw) else None,
             },
             # 新增：FastGPT 使用标记，方便前端判断
             "fastgpt_used": fastgpt_enabled,
+            "fast_batch":   fast_batch,
         }
     except Exception as e:
         _log(f'✗ 识别失败: {e}')
@@ -715,6 +907,67 @@ async def ocr_repair_order(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         _cleanup(tmp_path)
+
+
+@app.post("/api/ocr/repair-order/batch")
+async def ocr_repair_order_batch(
+    files: List[UploadFile] = File(...),
+    use_fastgpt: bool = Form(False),
+    fast_batch: bool = Form(True),
+    api_url: str = Form(""),
+    api_key: str = Form(""),
+    appid: str = Form(""),
+):
+    """调修单批量识别。默认 fast_batch=True（关闭表格结构重建与原表落盘，仅文本检测识别，速度更快）。"""
+    from datetime import datetime as dt
+
+    if not files:
+        raise HTTPException(status_code=400, detail="请至少上传一张图片")
+    processor = get_ocr_processor()
+    fastgpt_cfg = {"api_url": api_url, "api_key": api_key, "appid": appid} if use_fastgpt else None
+    out_list: List[dict] = []
+    for uf in files:
+        fn = uf.filename or "image"
+        tmp_path = _save_upload(uf)
+        session_dir = _create_session_dir()
+        try:
+            result = processor.process_image(
+                tmp_path,
+                use_fastgpt=use_fastgpt,
+                fastgpt_config=fastgpt_cfg,
+                output_dir=session_dir,
+                fast_batch=fast_batch,
+            )
+            extracted_fields = result["extracted_fields"]
+            fields_list = _field_result(extracted_fields, result["ocr_results"])
+            out_list.append({
+                "success": True,
+                "filename": fn,
+                "fields": fields_list,
+                "ocr_count": len(result["ocr_results"]),
+                "timestamp": result["timestamp"],
+                "fastgpt_used": use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get("api_key")),
+                "error": None,
+            })
+        except Exception as e:
+            traceback.print_exc()
+            out_list.append({
+                "success": False,
+                "filename": fn,
+                "fields": [],
+                "ocr_count": 0,
+                "timestamp": dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "fastgpt_used": False,
+                "error": str(e),
+            })
+        finally:
+            _cleanup(tmp_path)
+    return {
+        "success": all(x["success"] for x in out_list),
+        "fast_batch": fast_batch,
+        "count": len(out_list),
+        "results": out_list,
+    }
 
 
 @app.post("/api/ocr/repair-order/export")
@@ -930,17 +1183,176 @@ async def export_repair_order(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/ocr/repair-order/export-batch")
+async def export_repair_batch(
+    batch_json: str = Form(...),
+    doc_type: str = Form("repair_order"),
+    fmt: str = Form("excel"),
+    images: Optional[List[UploadFile]] = File(None),
+):
+    """
+    批量导出调修单或返修卡识别结果（多行同一工作表）。
+    batch_json: [{ "image_name", "recognition_time", "fields": [FieldResult,...] }, ...]
+    images: 可选，与 batch 行顺序一致的原图，用于 Excel 末列缩略图。
+    """
+    out_root = _get_output_dir()
+    try:
+        rows_in = json.loads(batch_json) if batch_json else []
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"batch_json 无效: {e}")
+    if not rows_in:
+        raise HTTPException(status_code=400, detail="batch_json 为空")
+
+    img_bytes_list: List[Optional[bytes]] = []
+    if images:
+        for im in images:
+            b = await im.read()
+            img_bytes_list.append(b if b else None)
+    while len(img_bytes_list) < len(rows_in):
+        img_bytes_list.append(None)
+
+    exports: dict[str, str] = {}
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    base = f"调修单批量_{ts}" if doc_type == 'repair_order' else f"返修卡批量_{ts}"
+
+    if doc_type == 'repair_order':
+        rows_out = []
+        for i, row in enumerate(rows_in):
+            fl = row.get('fields') or []
+            fm = _repair_order_field_map(fl if isinstance(fl, list) else [])
+            rows_out.append({
+                'image_name': row.get('image_name') or '',
+                'recognition_time': row.get('recognition_time') or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'field_map': fm,
+                'image_bytes': img_bytes_list[i],
+            })
+        if fmt in ('excel', 'all'):
+            path = os.path.join(out_root, f"{base}.xlsx")
+            _write_repair_order_excel_batch(path, rows_out)
+            exports['excel'] = path
+        if fmt in ('csv', 'all'):
+            import csv
+            path = os.path.join(out_root, f"{base}.csv")
+            headers = [
+                '图片名称', '调修单号', '装备型号', '器材名称', '型（图）号',
+                '器件编号', '邮寄地址', '进厂时间', '识别时间', '原图',
+            ]
+            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f)
+                w.writerow(headers)
+                for row in rows_out:
+                    fm = row['field_map']
+                    w.writerow([
+                        row['image_name'],
+                        fm.get('调修单号', ''),
+                        fm.get('装备型号', ''),
+                        fm.get('器材名称', ''),
+                        fm.get('型（图）号', ''),
+                        fm.get('器件编号', ''),
+                        fm.get('邮寄地址', ''),
+                        fm.get('进厂时间', ''),
+                        row['recognition_time'],
+                        '(见 Excel)' if row.get('image_bytes') else '',
+                    ])
+            exports['csv'] = path
+        if fmt in ('json', 'all'):
+            path = os.path.join(out_root, f"{base}.json")
+            dump = {
+                'doc_type': '调修单批量',
+                'export_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'rows': [],
+            }
+            for row in rows_out:
+                dump['rows'].append({
+                    'image_name': row['image_name'],
+                    'recognition_time': row['recognition_time'],
+                    'fields': {f: row['field_map'].get(f, '') for f in REPAIR_ORDER_EXPORT_FIELDS},
+                })
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(dump, f, ensure_ascii=False, indent=2)
+            exports['json'] = path
+    else:
+        rows_out = []
+        for i, row in enumerate(rows_in):
+            fl = row.get('fields') or []
+            fm = _repair_card_field_map(fl if isinstance(fl, list) else [])
+            rows_out.append({
+                'image_name': row.get('image_name') or '',
+                'recognition_time': row.get('recognition_time') or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'field_map': fm,
+                'image_bytes': img_bytes_list[i],
+            })
+        if fmt in ('excel', 'all'):
+            path = os.path.join(out_root, f"{base}.xlsx")
+            _write_repair_card_excel_batch(path, rows_out)
+            exports['excel'] = path
+        if fmt in ('csv', 'all'):
+            import csv
+            path = os.path.join(out_root, f"{base}.csv")
+            headers = [
+                '图片名称', '返修卡号', '产品代号', '联系人', '顾客单位', '批次号', '电话号',
+                '返修件名称', '图号', '返修故障件信息', '损坏原因修理结果', 'FRACAS/排故报告编号',
+                '识别时间', '原图',
+            ]
+            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f)
+                w.writerow(headers)
+                for row in rows_out:
+                    fm = row['field_map']
+                    w.writerow([
+                        row['image_name'],
+                        fm.get('返修卡号', ''),
+                        fm.get('产品代号', ''),
+                        fm.get('联系人', ''),
+                        fm.get('顾客单位', ''),
+                        fm.get('批次号', ''),
+                        fm.get('电话号', ''),
+                        fm.get('返修件名称', ''),
+                        fm.get('图号', ''),
+                        fm.get('返修故障件信息', ''),
+                        fm.get('损坏原因修理结果', ''),
+                        fm.get('FRACAS/排故报告编号', ''),
+                        row['recognition_time'],
+                        '(见 Excel)' if row.get('image_bytes') else '',
+                    ])
+            exports['csv'] = path
+        if fmt in ('json', 'all'):
+            path = os.path.join(out_root, f"{base}.json")
+            dump = {
+                'doc_type': '返修卡批量',
+                'export_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'rows': [],
+            }
+            for row in rows_out:
+                dump['rows'].append({
+                    'image_name': row['image_name'],
+                    'recognition_time': row['recognition_time'],
+                    'fields': {f: row['field_map'].get(f, '') for f in REPAIR_CARD_EXPORT_FIELDS},
+                })
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(dump, f, ensure_ascii=False, indent=2)
+            exports['json'] = path
+
+    return {
+        "success": True,
+        "exports": exports,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 @app.post("/api/ocr/repair-card")
 async def ocr_repair_card(
     file: UploadFile = File(...),
     use_fastgpt: bool = Form(False),
+    fast_batch: bool = Form(False),
     api_url:  str = Form(""),
     api_key:  str = Form(""),
     appid:    str = Form(""),
 ):
     """
     返修卡 OCR：PPStructureV3 版面/表格 + RepairCardParser 字段 + 可选 FastGPT。
-    返回：{ success, fields, ocr_count, timestamp, raw_exports, fastgpt_used }
+    fast_batch=True：关闭表格结构识别、不落盘原表文件。
+    返回：{ success, fields, ocr_count, timestamp, raw_exports, fastgpt_used, fast_batch }
     """
     from datetime import datetime as dt
     import sys
@@ -968,18 +1380,20 @@ async def ocr_repair_card(
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_cfg,
             output_dir=session_dir,
+            fast_batch=fast_batch,
         )
         elapsed = (dt.now() - t0).total_seconds()
 
         extracted_fields = result["extracted_fields"]
         fastgpt_enabled = use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get('api_key'))
-        _log(f'✓ 识别完成，耗时 {elapsed:.1f}s，FastGPT={fastgpt_enabled}，字段: {extracted_fields}')
+        _log(f'✓ 识别完成，耗时 {elapsed:.1f}s，FastGPT={fastgpt_enabled}，fast_batch={fast_batch}，字段: {extracted_fields}')
 
         fields_list = _field_result(extracted_fields, result["ocr_results"])
 
         base_name = os.path.splitext(os.path.basename(tmp_path))[0]
         raw_json_path = os.path.join(session_dir, f"{base_name}.json")
         raw_html_path = os.path.join(session_dir, f"{base_name}_table.html")
+        xlsx_raw = (result.get("xlsx_path") or "").strip()
 
         return {
             "success":   True,
@@ -989,8 +1403,10 @@ async def ocr_repair_card(
             "raw_exports": {
                 "json": raw_json_path if os.path.exists(raw_json_path) else None,
                 "html": raw_html_path if os.path.exists(raw_html_path) else None,
+                "xlsx": xlsx_raw if xlsx_raw and os.path.exists(xlsx_raw) else None,
             },
             "fastgpt_used": fastgpt_enabled,
+            "fast_batch":   fast_batch,
         }
     except Exception as e:
         _log(f'✗ 识别失败: {e}')
@@ -998,6 +1414,67 @@ async def ocr_repair_card(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         _cleanup(tmp_path)
+
+
+@app.post("/api/ocr/repair-card/batch")
+async def ocr_repair_card_batch(
+    files: List[UploadFile] = File(...),
+    use_fastgpt: bool = Form(False),
+    fast_batch: bool = Form(True),
+    api_url: str = Form(""),
+    api_key: str = Form(""),
+    appid: str = Form(""),
+):
+    """返修卡批量识别。默认 fast_batch=True（关闭表格结构重建与原表落盘，仅文本检测识别，速度更快）。"""
+    from datetime import datetime as dt
+
+    if not files:
+        raise HTTPException(status_code=400, detail="请至少上传一张图片")
+    processor = get_ocr_processor()
+    fastgpt_cfg = {"api_url": api_url, "api_key": api_key, "appid": appid} if use_fastgpt else None
+    out_list: List[dict] = []
+    for uf in files:
+        fn = uf.filename or "image"
+        tmp_path = _save_upload(uf)
+        session_dir = _create_session_dir()
+        try:
+            result = processor.process_repair_card(
+                tmp_path,
+                use_fastgpt=use_fastgpt,
+                fastgpt_config=fastgpt_cfg,
+                output_dir=session_dir,
+                fast_batch=fast_batch,
+            )
+            extracted_fields = result["extracted_fields"]
+            fields_list = _field_result(extracted_fields, result["ocr_results"])
+            out_list.append({
+                "success": True,
+                "filename": fn,
+                "fields": fields_list,
+                "ocr_count": len(result["ocr_results"]),
+                "timestamp": result["timestamp"],
+                "fastgpt_used": use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get("api_key")),
+                "error": None,
+            })
+        except Exception as e:
+            traceback.print_exc()
+            out_list.append({
+                "success": False,
+                "filename": fn,
+                "fields": [],
+                "ocr_count": 0,
+                "timestamp": dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "fastgpt_used": False,
+                "error": str(e),
+            })
+        finally:
+            _cleanup(tmp_path)
+    return {
+        "success": all(x["success"] for x in out_list),
+        "fast_batch": fast_batch,
+        "count": len(out_list),
+        "results": out_list,
+    }
 
 
 @app.post("/api/ocr/material")

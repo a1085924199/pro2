@@ -4,8 +4,8 @@ import { ArrowLeftOutlined, HomeOutlined, BranchesOutlined } from '@ant-design/i
 
 const routeTitles: Record<string, string> = {
   '/': '智能链路 OCR 平台',
-  '/return-repair-quote': '返修件报价智能链路',
-  '/material-in-out': '航材出入库整理智能链路',
+  '/return-repair-quote': '地面返修件报价智能链路',
+  '/material-in-out': '航材返修件报价智能链路',
   '/general-ocr': '通用纸质材料识别',
 }
 

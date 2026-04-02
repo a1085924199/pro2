@@ -99,7 +99,7 @@ export default function MaterialInOutPage() {
           </div>
           <div>
             <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700, color: '#e6edf3' }}>
-              航材出入库整理智能链路
+              航材返修件报价智能链路
             </h1>
             <p style={{ margin: 0, color: '#7d8590', fontSize: 13 }}>
               识别航材出入库单据，自动结构化提取字段数据

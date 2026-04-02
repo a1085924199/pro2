@@ -42,6 +42,7 @@ export interface OcrResponse {
   raw_exports?: {
     json?: string | null
     html?: string | null
+    xlsx?: string | null
   }
   /** FastGPT 是否被用于增强识别 */
   fastgpt_used?: boolean
@@ -56,15 +57,51 @@ export async function checkHealth(): Promise<{ status: string }> {
 // ─── 调修单 OCR ──────────────────────────────────────────────
 export async function ocrRepairOrder(
   file: File,
-  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string },
-): Promise<OcrResponse> {
+  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string; fastBatch?: boolean },
+): Promise<OcrResponse & { fast_batch?: boolean }> {
   const form = new FormData()
   form.append('file', file)
   form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
+  form.append('fast_batch', String(opts?.fastBatch ?? false))
   form.append('api_url',  opts?.apiUrl  ?? '')
   form.append('api_key',  opts?.apiKey  ?? '')
   form.append('appid',    opts?.appid   ?? '')
   const res = await ocrApi.post('/ocr/repair-order', form)
+  return res.data
+}
+
+/** 调修单批量识别 */
+export async function ocrRepairOrderBatch(
+  files: File[],
+  opts?: { useFastgpt?: boolean; fastBatch?: boolean; apiUrl?: string; apiKey?: string; appid?: string },
+): Promise<{
+  success: boolean; fast_batch: boolean; count: number
+  results: Array<{ success: boolean; filename: string; fields: FieldResult[]; ocr_count: number; timestamp: string; fastgpt_used: boolean; error: string | null }>
+}> {
+  const form = new FormData()
+  for (const f of files) form.append('files', f)
+  form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
+  form.append('fast_batch', String(opts?.fastBatch ?? true))
+  form.append('api_url',  opts?.apiUrl  ?? '')
+  form.append('api_key',  opts?.apiKey  ?? '')
+  form.append('appid',    opts?.appid   ?? '')
+  const res = await ocrApi.post('/ocr/repair-order/batch', form)
+  return res.data
+}
+
+/** 批量导出调修单 / 返修卡识别结果（多行同一工作表） */
+export async function exportRepairBatch(
+  rows: Array<{ image_name: string; recognition_time: string; fields: FieldResult[] }>,
+  docType: 'repair_order' | 'repair_card',
+  fmt: 'excel' | 'csv' | 'json' | 'all' = 'excel',
+  images?: File[],
+): Promise<{ success: boolean; exports: Record<string, string>; timestamp: string }> {
+  const form = new FormData()
+  form.append('batch_json', JSON.stringify(rows))
+  form.append('doc_type', docType)
+  form.append('fmt', fmt)
+  if (images) for (const im of images) form.append('images', im)
+  const res = await (images ? ocrApi : api).post('/ocr/repair-order/export-batch', form)
   return res.data
 }
 
@@ -106,10 +143,11 @@ export interface StepFastgptConfig {
 }
 
 export interface FastgptConfig {
-  repair_order_ocr: StepFastgptConfig
-  repair_card_ocr:  StepFastgptConfig
-  ids_match:        StepFastgptConfig
-  quote_generation: StepFastgptConfig
+  repair_order_ocr:  StepFastgptConfig
+  repair_card_ocr:   StepFastgptConfig
+  archive_generation: StepFastgptConfig
+  ids_match:         StepFastgptConfig
+  quote_generation:  StepFastgptConfig
 }
 
 export async function getFastgptConfig(): Promise<FastgptConfig> {
@@ -125,15 +163,35 @@ export async function saveFastgptConfig(cfg: FastgptConfig): Promise<{ success: 
 // ─── 返修卡 OCR ──────────────────────────────────────────────
 export async function ocrRepairCard(
   file: File,
-  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string },
-): Promise<OcrResponse> {
+  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string; fastBatch?: boolean },
+): Promise<OcrResponse & { fast_batch?: boolean }> {
   const form = new FormData()
   form.append('file', file)
   form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
+  form.append('fast_batch', String(opts?.fastBatch ?? false))
   form.append('api_url',  opts?.apiUrl  ?? '')
   form.append('api_key',  opts?.apiKey  ?? '')
   form.append('appid',    opts?.appid   ?? '')
   const res = await ocrApi.post('/ocr/repair-card', form)
+  return res.data
+}
+
+/** 返修卡批量识别 */
+export async function ocrRepairCardBatch(
+  files: File[],
+  opts?: { useFastgpt?: boolean; fastBatch?: boolean; apiUrl?: string; apiKey?: string; appid?: string },
+): Promise<{
+  success: boolean; fast_batch: boolean; count: number
+  results: Array<{ success: boolean; filename: string; fields: FieldResult[]; ocr_count: number; timestamp: string; fastgpt_used: boolean; error: string | null }>
+}> {
+  const form = new FormData()
+  for (const f of files) form.append('files', f)
+  form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
+  form.append('fast_batch', String(opts?.fastBatch ?? true))
+  form.append('api_url',  opts?.apiUrl  ?? '')
+  form.append('api_key',  opts?.apiKey  ?? '')
+  form.append('appid',    opts?.appid   ?? '')
+  const res = await ocrApi.post('/ocr/repair-card/batch', form)
   return res.data
 }
 

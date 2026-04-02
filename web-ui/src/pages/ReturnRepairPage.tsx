@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Steps, Button, Tag, Divider, Switch, Input, message, Dropdown } from 'antd'
+import { Steps, Button, Tag, Divider, Switch, Input, message, Dropdown, Table } from 'antd'
 import {
   ScanOutlined,
   FileSearchOutlined,
@@ -21,7 +21,10 @@ import ResultTable from '../components/ResultTable'
 import {
   ocrRepairOrder,
   ocrRepairCard,
+  ocrRepairOrderBatch,
+  ocrRepairCardBatch,
   exportRepairOrder,
+  exportRepairBatch,
   getFastgptConfig,
   saveFastgptConfig,
   downloadExportFile,
@@ -33,38 +36,51 @@ import {
 const STEPS = [
   { key: 'repair_order_ocr' as keyof FastgptConfig, title: '调修单 OCR 识别', description: '维修器材调修单扫描件识别', icon: <ScanOutlined />, color: '#3378ff' },
   { key: 'repair_card_ocr' as keyof FastgptConfig,  title: '返修卡 OCR 识别', description: '返修件返修卡扫描件识别',   icon: <FileSearchOutlined />, color: '#00d4aa' },
-  { key: 'ids_match' as keyof FastgptConfig,        title: 'IDS 系统匹配',   description: '与 IDS 系统数据进行信息匹配', icon: <ApiOutlined />, color: '#f0a020' },
-  { key: 'quote_generation' as keyof FastgptConfig, title: '报价数据生成',   description: '汇总识别结果，生成报价单',    icon: <DollarOutlined />, color: '#a855f7' },
+  { key: 'archive_generation' as keyof FastgptConfig, title: '返修件档案生成', description: '调修单与返修卡信息智能融合', icon: <ApiOutlined />, color: '#f0a020' },
+  { key: 'ids_match' as keyof FastgptConfig,        title: '报价信息关联',   description: '提取IDS系统数据进行信息匹配', icon: <ApiOutlined />, color: '#f0a020' },
+  { key: 'quote_generation' as keyof FastgptConfig, title: '报价数据生成',   description: '智能信息汇总，生成报价单',    icon: <DollarOutlined />, color: '#a855f7' },
 ]
+
+interface BatchResultItem {
+  filename: string
+  fields: FieldResult[]
+  ocr_count: number
+  timestamp: string
+  fastgpt_used: boolean
+  error?: string | null
+}
 
 interface StepState {
   status:  'idle' | 'processing' | 'done' | 'error'
   files:   File[]
   results: FieldResult[]
   info:    string
-  progress_detail?: string  // 新增：详细进度描述
-  cachedFields?: FieldResult[]  // 缓存识别结果，供导出使用
-  /** OCR 返回的识别时间，写入导出表「识别时间」列 */
+  progress_detail?: string
+  cachedFields?: FieldResult[]
   recognizedAt?: string
-  /** PPStructureV3 原始表格文件路径 */
   rawExports?: {
     json?: string | null
     html?: string | null
+    xlsx?: string | null
   }
-  /** FastGPT 是否被用于增强识别 */
   fastgptUsed?: boolean
+  /** 批量模式时每张图片的识别结果（用于批量导出） */
+  batchResults?: BatchResultItem[]
+  /** 批量模式下是否使用快速识别 */
+  fastBatch?: boolean
 }
 
 function initState(): StepState {
-  return { status: 'idle', files: [], results: [], info: '', progress_detail: '', cachedFields: undefined, recognizedAt: undefined, rawExports: undefined, fastgptUsed: undefined }
+  return { status: 'idle', files: [], results: [], info: '', progress_detail: '', cachedFields: undefined, recognizedAt: undefined, rawExports: undefined, fastgptUsed: undefined, batchResults: undefined, fastBatch: false }
 }
 
 const EMPTY_FGPT: StepFastgptConfig = { api_url: '', api_key: '', appid: '', enabled: false }
 const DEFAULT_CFG: FastgptConfig = {
-  repair_order_ocr: { ...EMPTY_FGPT },
-  repair_card_ocr:  { ...EMPTY_FGPT },
-  ids_match:        { ...EMPTY_FGPT },
-  quote_generation: { ...EMPTY_FGPT },
+  repair_order_ocr:   { ...EMPTY_FGPT },
+  repair_card_ocr:    { ...EMPTY_FGPT },
+  archive_generation: { ...EMPTY_FGPT },
+  ids_match:         { ...EMPTY_FGPT },
+  quote_generation:  { ...EMPTY_FGPT },
 }
 
 const IDS_MOCK: FieldResult[] = [
@@ -182,80 +198,155 @@ export default function ReturnRepairPage() {
   }
 
   const handleProcess = async (idx: number) => {
-    if (idx === 2 || idx === 3) {
-      updateStep(idx, { status: 'processing', progress_detail: '正在连接 IDS 系统...' })
-      const progressSteps = idx === 2
-        ? ['正在连接 IDS 系统...', '正在获取设备信息...', '正在匹配置信度计算...', '匹配完成']
-        : ['正在汇总数据...', '正在生成报价...', '正在计算费用明细...', '报价生成完成']
+    // 步骤 2、3、4 为模拟链路（档案生成、报价信息关联、报价数据生成）
+    if (idx === 2) {
+      updateStep(idx, { status: 'processing', progress_detail: '正在融合调修单与返修卡信息...' })
+      const progressSteps = ['正在读取调修单数据...', '正在读取返修卡数据...', '正在智能融合信息...', '档案生成完成']
       const interval = animateProgress(idx, progressSteps)
       await new Promise((r) => setTimeout(r, 1200))
       clearInterval(interval)
-      updateStep(idx, { status: 'done', results: idx === 2 ? IDS_MOCK : QUOTE_MOCK, info: '', progress_detail: '' })
+      updateStep(idx, { status: 'done', results: [], info: '', progress_detail: '' })
+      return
+    }
+    if (idx === 3) {
+      updateStep(idx, { status: 'processing', progress_detail: '正在连接 IDS 系统...' })
+      const progressSteps = ['正在连接 IDS 系统...', '正在获取设备信息...', '正在匹配置信度计算...', '匹配完成']
+      const interval = animateProgress(idx, progressSteps)
+      await new Promise((r) => setTimeout(r, 1200))
+      clearInterval(interval)
+      updateStep(idx, { status: 'done', results: IDS_MOCK, info: '', progress_detail: '' })
+      return
+    }
+    if (idx === 4) {
+      updateStep(idx, { status: 'processing', progress_detail: '正在汇总报价数据...' })
+      const progressSteps = ['正在汇总数据...', '正在生成报价...', '正在计算费用明细...', '报价生成完成']
+      const interval = animateProgress(idx, progressSteps)
+      await new Promise((r) => setTimeout(r, 1200))
+      clearInterval(interval)
+      updateStep(idx, { status: 'done', results: QUOTE_MOCK, info: '', progress_detail: '' })
       return
     }
     const state = stepStates[idx]
     if (state.files.length === 0) { messageApi.warning('请先上传图片文件'); return }
-    updateStep(idx, { status: 'processing', progress_detail: '正在准备识别...' })
-    
-    // 启动进度动画
-    const progressSteps = ['正在加载 OCR 引擎...', '正在进行文本检测...', '正在进行文本识别...', '正在提取字段信息...', '正在生成结果...']
-    const interval = animateProgress(idx, progressSteps)
-    
+
     const sc = fgptCfg[STEPS[idx].key]
-    const opts = sc.enabled
-      ? { useFastgpt: true, apiUrl: sc.api_url, apiKey: sc.api_key, appid: sc.appid }
-      : { useFastgpt: false }
-    try {
-      const resp = idx === 0
-        ? await ocrRepairOrder(state.files[0], opts)
-        : await ocrRepairCard(state.files[0], opts)
-      clearInterval(interval)
-      updateStep(idx, {
-        status: 'done',
-        results: resp.fields,
-        cachedFields: resp.fields,
-        recognizedAt: resp.timestamp,
-        info: `识别 ${resp.ocr_count} 个文本块 · ${resp.timestamp}`,
-        progress_detail: '',
-        rawExports: resp.raw_exports,
-        fastgptUsed: resp.fastgpt_used,
-      })
-      messageApi.success(`步骤 ${idx + 1} 识别完成`)
-    } catch (e: unknown) {
-      clearInterval(interval)
-      const msg = e instanceof Error ? e.message : String(e)
-      updateStep(idx, { status: 'error', info: msg, progress_detail: '' })
-      messageApi.error(`识别失败：${msg}`)
+    const fastBatch = state.files.length > 1
+    const commonOpts = sc.enabled
+      ? { useFastgpt: true, apiUrl: sc.api_url, apiKey: sc.api_key, appid: sc.appid, fastBatch }
+      : { useFastgpt: false, fastBatch }
+
+    if (fastBatch) {
+      // ── 批量模式 ──────────────────────────────────────────────
+      updateStep(idx, { status: 'processing', progress_detail: `正在批量识别 ${state.files.length} 张图片...`, fastBatch: true, batchResults: [], results: [] })
+      try {
+        const resp = idx === 0
+          ? await ocrRepairOrderBatch(state.files, commonOpts)
+          : await ocrRepairCardBatch(state.files, commonOpts)
+
+        const items: BatchResultItem[] = resp.results.map(r => ({
+          filename: r.filename,
+          fields: r.fields,
+          ocr_count: r.ocr_count,
+          timestamp: r.timestamp,
+          fastgpt_used: r.fastgpt_used,
+          error: r.error,
+        }))
+        const successCount = items.filter(r => !r.error).length
+        updateStep(idx, {
+          status: 'done',
+          batchResults: items,
+          results: [],
+          info: `批量识别完成：${successCount}/${state.files.length} 张成功`,
+          progress_detail: '',
+        })
+        messageApi.success(`批量识别完成：${successCount}/${state.files.length} 张成功`)
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e)
+        updateStep(idx, { status: 'error', info: msg, progress_detail: '' })
+        messageApi.error(`批量识别失败：${msg}`)
+      }
+    } else {
+      // ── 单张模式 ──────────────────────────────────────────────
+      updateStep(idx, { status: 'processing', progress_detail: '正在准备识别...', fastBatch: false })
+      const progressSteps = ['正在加载 OCR 引擎...', '正在进行文本检测...', '正在进行文本识别...', '正在提取字段信息...', '正在生成结果...']
+      const interval = animateProgress(idx, progressSteps)
+      try {
+        const resp = idx === 0
+          ? await ocrRepairOrder(state.files[0], commonOpts)
+          : await ocrRepairCard(state.files[0], commonOpts)
+        clearInterval(interval)
+        updateStep(idx, {
+          status: 'done',
+          results: resp.fields,
+          cachedFields: resp.fields,
+          recognizedAt: resp.timestamp,
+          info: `识别 ${resp.ocr_count} 个文本块 · ${resp.timestamp}`,
+          progress_detail: '',
+          rawExports: resp.raw_exports,
+          fastgptUsed: resp.fastgpt_used,
+          fastBatch: resp.fast_batch,
+        })
+        messageApi.success(`步骤 ${idx + 1} 识别完成`)
+      } catch (e: unknown) {
+        clearInterval(interval)
+        const msg = e instanceof Error ? e.message : String(e)
+        updateStep(idx, { status: 'error', info: msg, progress_detail: '' })
+        messageApi.error(`识别失败：${msg}`)
+      }
     }
   }
 
-  // 调修单识别结果导出
+  // 调修单/返修卡识别结果导出
   const handleExport = async (idx: number, fmt: 'excel' | 'csv' | 'json' | 'all') => {
     const state = stepStates[idx]
     const fields = state.cachedFields ?? state.results
-    if (fields.length === 0) {
-      messageApi.warning('没有可导出的识别结果')
+
+    // ── 批量导出 ────────────────────────────────────────────
+    if (state.batchResults && state.batchResults.length > 0) {
+      const docType = idx === 0 ? 'repair_order' : 'repair_card'
+      // 构造导出行（只有识别成功的行）
+      const rows = state.batchResults
+        .filter(r => !r.error && r.fields.length > 0)
+        .map(r => ({
+          image_name: r.filename,
+          recognition_time: r.timestamp,
+          fields: r.fields,
+        }))
+      if (rows.length === 0) { messageApi.warning('没有可导出的识别结果'); return }
+      // 找出与 rows 顺序对应的原图 File
+      const nameToFile: Record<string, File> = {}
+      for (const f of state.files) nameToFile[f.name] = f
+      const images = rows.map(r => nameToFile[r.image_name]).filter(Boolean) as File[]
+      try {
+        const resp = await exportRepairBatch(rows, docType, fmt, images)
+        const exports = resp.exports ?? {}
+        if (Object.keys(exports).length > 0) {
+          for (const [, filePath] of Object.entries(exports)) {
+            const filename = filePath.split(/[\\/]/).pop() || 'export'
+            downloadExportFile(filename)
+            await new Promise((r) => setTimeout(r, 300))
+          }
+          messageApi.success('批量导出成功')
+        } else {
+          messageApi.warning('未能获取导出文件')
+        }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e)
+        messageApi.error(`批量导出失败：${msg}`)
+      }
       return
     }
+
+    // ── 单张导出 ────────────────────────────────────────────
+    if (fields.length === 0) { messageApi.warning('没有可导出的识别结果'); return }
     try {
       const exportOpts =
         idx === 0
-          ? {
-              docType: 'repair_order' as const,
-              imageFile: state.files[0],
-              imageName: state.files[0]?.name ?? '',
-              recognitionTime: state.recognizedAt ?? '',
-            }
-          : {
-              docType: 'repair_card' as const,
-              imageFile: state.files[0],
-              imageName: state.files[0]?.name ?? '',
-              recognitionTime: state.recognizedAt ?? '',
-            }
+          ? { docType: 'repair_order' as const, imageFile: state.files[0], imageName: state.files[0]?.name ?? '', recognitionTime: state.recognizedAt ?? '' }
+          : { docType: 'repair_card' as const, imageFile: state.files[0], imageName: state.files[0]?.name ?? '', recognitionTime: state.recognizedAt ?? '' }
       const resp = await exportRepairOrder(fields, fmt, exportOpts)
       const exports = resp.exports ?? {}
       if (Object.keys(exports).length > 0) {
-        // 依次触发下载
         for (const [, filePath] of Object.entries(exports)) {
           const filename = filePath.split(/[\\/]/).pop() || 'export'
           downloadExportFile(filename)
@@ -271,10 +362,10 @@ export default function ReturnRepairPage() {
     }
   }
 
-  // 下载原始表格文件（JSON/HTML）
-  const handleExportRaw = async (idx: number, type: 'json' | 'html') => {
+  // 下载原始表格文件（JSON/HTML/Excel）
+  const handleExportRaw = async (idx: number, type: 'json' | 'html' | 'xlsx') => {
     const state = stepStates[idx]
-    const rawPath = type === 'json' ? state.rawExports?.json : state.rawExports?.html
+    const rawPath = type === 'json' ? state.rawExports?.json : type === 'html' ? state.rawExports?.html : state.rawExports?.xlsx
     if (!rawPath) {
       messageApi.warning('没有可下载的原始表格文件')
       return
@@ -311,7 +402,7 @@ export default function ReturnRepairPage() {
             <DollarOutlined />
           </div>
           <div>
-            <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700, color: '#e6edf3' }}>返修件报价智能链路</h1>
+            <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700, color: '#e6edf3' }}>地面返修件报价智能链路</h1>
             <p style={{ margin: 0, color: '#7d8590', fontSize: 13 }}>按步骤完成各阶段识别，最终生成报价数据</p>
           </div>
         </div>
@@ -375,7 +466,14 @@ export default function ReturnRepairPage() {
             {/* 上传区 — 仅步骤0、1显示 */}
             {current < 2 && (
               <div className="mb-6">
-                <div style={{ color: '#7d8590', fontSize: 13, marginBottom: 10 }}>上传扫描件图片</div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+                  <div style={{ color: '#7d8590', fontSize: 13 }}>上传扫描件图片</div>
+                  {state.files.length > 1 && (
+                    <div style={{ color: '#00d4aa', fontSize: 12, fontWeight: 600 }}>
+                      已选择 {state.files.length} 张图片，将自动启用批量快速识别模式
+                    </div>
+                  )}
+                </div>
                 <UploadZone
                   onFiles={(files) =>
                     updateStep(current, {
@@ -386,9 +484,11 @@ export default function ReturnRepairPage() {
                       recognizedAt: undefined,
                       rawExports: undefined,
                       fastgptUsed: undefined,
+                      batchResults: undefined,
+                      fastBatch: false,
                     })
                   }
-                  multiple={false}
+                  multiple={true}
                 />
               </div>
             )}
@@ -420,7 +520,11 @@ export default function ReturnRepairPage() {
                 onClick={() => handleProcess(current)}
                 style={{ background: step.color, borderColor: step.color, boxShadow: `0 4px 14px ${step.color}50` }}
               >
-                {state.status === 'processing' ? '识别中...' : '开始处理'}
+                {state.status === 'processing'
+                  ? '识别中...'
+                  : state.files.length > 1
+                    ? `批量识别 ${state.files.length} 张`
+                    : '开始处理'}
               </Button>
               {/* 进度详情显示 */}
               {state.status === 'processing' && state.progress_detail && (
@@ -453,7 +557,7 @@ export default function ReturnRepairPage() {
                   {state.progress_detail}
                 </motion.div>
               )}
-              {state.status === 'done' && current < STEPS.length - 1 && (
+              {state.status === 'done' && current < STEPS.length - 2 && (
                 <Button onClick={() => setCurrent(current + 1)}
                   style={{ background: '#1c2128', borderColor: '#30363d', color: '#e6edf3' }}>
                   下一步 →
@@ -463,7 +567,55 @@ export default function ReturnRepairPage() {
 
             {/* 识别结果 */}
             <AnimatePresence>
-              {state.status === 'done' && state.results.length > 0 && (
+              {/* 批量模式：显示结果列表 */}
+              {state.status === 'done' && state.batchResults && state.batchResults.length > 0 && (
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                  <Divider style={{ borderColor: '#21262d', margin: '0 0 16px' }} />
+                  {state.info && <p style={{ color: '#7d8590', fontSize: 12, marginBottom: 12 }}>{state.info}</p>}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+                    <div style={{ color: '#7d8590', fontSize: 13 }}>批量识别结果（共 {state.batchResults.length} 张）</div>
+                    <div style={{ color: '#00d4aa', fontSize: 12 }}>
+                      {state.batchResults.filter(r => !r.error).length} 成功 / {state.batchResults.length} 总数
+                    </div>
+                  </div>
+                  <div className="mb-4" style={{ maxHeight: 360, overflowY: 'auto', borderRadius: 8, border: '1px solid #21262d' }}>
+                    <Table
+                      size="small"
+                      pagination={false}
+                      dataSource={state.batchResults.map((r, i) => ({ ...r, key: i }))}
+                      columns={[
+                        { title: '图片名称', dataIndex: 'filename', key: 'filename', render: (v) => <span style={{ color: '#e6edf3', fontSize: 12 }}>{v}</span> },
+                        { title: '识别状态', dataIndex: 'error', key: 'error', width: 90, render: (e) => e ? <span style={{ color: '#f85149', fontSize: 12 }}>失败</span> : <span style={{ color: '#00d4aa', fontSize: 12 }}>成功</span> },
+                        { title: '文本块数', dataIndex: 'ocr_count', key: 'ocr_count', width: 80, render: (v) => <span style={{ color: '#7d8590', fontSize: 12 }}>{v}</span> },
+                        { title: '识别时间', dataIndex: 'timestamp', key: 'timestamp', width: 160, render: (v) => <span style={{ color: '#484f58', fontSize: 12 }}>{v}</span> },
+                        { title: '错误信息', dataIndex: 'error', key: 'err', render: (e) => e ? <span style={{ color: '#f85149', fontSize: 11, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }} title={e}>{e}</span> : <span style={{ color: '#484f58', fontSize: 12 }}>-</span> },
+                      ]}
+                    />
+                  </div>
+                  {/* 批量导出（批量模式不显示原表输出，因为 fast_batch=True 时没有原表） */}
+                  <div className="flex gap-2 mb-4">
+                    <Dropdown
+                      menu={{
+                        items: [
+                          { key: 'excel', icon: <FileExcelOutlined />, label: '导出 Excel (.xlsx)', onClick: () => handleExport(current, 'excel') },
+                          { key: 'csv', icon: <FileTextOutlined />, label: '导出 CSV (.csv)', onClick: () => handleExport(current, 'csv') },
+                          { key: 'json', icon: <CloudOutlined />, label: '导出 JSON (.json)', onClick: () => handleExport(current, 'json') },
+                          { type: 'divider' as const },
+                          { key: 'all', icon: <DownloadOutlined />, label: '导出全部格式', onClick: () => handleExport(current, 'all') },
+                        ],
+                      }}
+                      trigger={['click']}
+                      placement="bottomLeft"
+                    >
+                      <Button icon={<DownloadOutlined />} style={{ background: '#1f883d', borderColor: '#1f883d', color: '#fff' }}>
+                        批量导出
+                      </Button>
+                    </Dropdown>
+                  </div>
+                </motion.div>
+              )}
+              {/* 单张模式：显示字段表格 */}
+              {state.status === 'done' && state.results.length > 0 && !state.batchResults && (
                 <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }}>
                   <Divider style={{ borderColor: '#21262d', margin: '0 0 16px' }} />
                   {state.info && <p style={{ color: '#7d8590', fontSize: 12, marginBottom: 12 }}>{state.info}</p>}
@@ -530,6 +682,13 @@ export default function ReturnRepairPage() {
                               onClick: () => handleExportRaw(current, 'html'),
                               disabled: !state.rawExports?.html,
                             },
+                            {
+                              key: 'raw_xlsx',
+                              icon: <FileExcelOutlined />,
+                              label: 'Excel (.xlsx)',
+                              onClick: () => handleExportRaw(current, 'xlsx'),
+                              disabled: !state.rawExports?.xlsx,
+                            },
                           ],
                         }}
                         trigger={['click']}
@@ -538,7 +697,7 @@ export default function ReturnRepairPage() {
                         <Button
                           icon={<DownloadOutlined />}
                           style={{ background: '#21262d', borderColor: '#30363d', color: '#e6edf3' }}
-                          disabled={!state.rawExports?.json && !state.rawExports?.html}
+                          disabled={!state.rawExports?.json && !state.rawExports?.html && !state.rawExports?.xlsx}
                         >
                           原表输出
                         </Button>
