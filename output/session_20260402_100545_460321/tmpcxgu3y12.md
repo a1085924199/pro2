@@ -1,0 +1,5 @@
+<div style="text-align: center;">器材调修通知单</div>
+
+
+
+<div style="text-align: center;"><html><body><table border="1"><tr><td>调修单号：DK2025QCLD04Z07N508 填表日期：2025年12月9日</td><td colspan="2"></td><td></td><td></td></tr><tr><td>装备型号</td><td colspan="2"></td><td>出厂编号</td><td>5220703013</td></tr><tr><td>器材名称</td><td colspan="2">数字T/R组件A</td><td>型（图）号</td><td>AL2.908.2329</td></tr><tr><td>器件编号</td><td colspan="2">5210052</td><td>装机部位</td><td>天线阵面</td></tr><tr><td rowspan="3">送修次数</td><td>0</td><td>故障时间</td><td>12月7日9时00分</td><td>送修单位 (填修复 后直接接 收单位）</td></tr><tr><td>收件人</td><td>寿宇凡</td><td>电话</td><td>13328037312</td></tr><tr><td>邮寄地址</td><td colspan="3">福建省福州市长乐区滨江望郡家家福超市</td></tr><tr><td rowspan="3">承修单位</td><td>单位名称</td><td>南京14所</td><td>邮编</td><td>510096</td></tr><tr><td>收件人</td><td>顾灿春</td><td>电话</td><td>13851796934</td></tr><tr><td>邮寄地址</td><td colspan="3">江苏省南京市雨花区国睿路8号14所南</td></tr><tr><td colspan="2">新品价格</td><td></td><td>是否质量保证期 内</td><td>是</td></tr></table></body></html></div>

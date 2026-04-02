@@ -139,6 +139,12 @@ REPAIR_ORDER_EXPORT_FIELDS = [
     '调修单号', '装备型号', '器材名称', '型（图）号', '器件编号', '邮寄地址', '进厂时间',
 ]
 
+# 返修卡导出字段（与 ocr_core.RepairCardParser.FIELDS 一致）
+REPAIR_CARD_EXPORT_FIELDS = [
+    '返修卡号', '产品代号', '联系人', '顾客单位', '批次号', '电话号',
+    '返修件名称', '图号', '返修故障件信息', '损坏原因修理结果', 'FRACAS/排故报告编号',
+]
+
 
 def _repair_order_field_map(fields_list: list) -> dict[str, str]:
     m: dict[str, str] = {}
@@ -146,6 +152,16 @@ def _repair_order_field_map(fields_list: list) -> dict[str, str]:
         f = item.get('field', '')
         v = item.get('value', '')
         if f in REPAIR_ORDER_EXPORT_FIELDS:
+            m[f] = v
+    return m
+
+
+def _repair_card_field_map(fields_list: list) -> dict[str, str]:
+    m: dict[str, str] = {}
+    for item in fields_list:
+        f = item.get('field', '')
+        v = item.get('value', '')
+        if f in REPAIR_CARD_EXPORT_FIELDS:
             m[f] = v
     return m
 
@@ -224,6 +240,96 @@ def _write_repair_order_excel_template(
             ws.row_dimensions[2].height = 220
         except Exception as e:
             print(f'[调修单导出] 嵌入原图失败（仍保存表格）: {e}', flush=True)
+    else:
+        ws.row_dimensions[2].height = 28
+
+    wb.save(path)
+    if thumb_path:
+        try:
+            os.unlink(thumb_path)
+        except OSError:
+            pass
+
+
+def _write_repair_card_excel_template(
+    path: str,
+    field_map: dict[str, str],
+    image_name: str,
+    recognition_time: str,
+    image_bytes: Optional[bytes],
+) -> None:
+    """返修卡：横向一行 + 多列字段 + 末列嵌入缩略原图。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.drawing.image import Image as XLImage
+    from PIL import Image as PILImage
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '返修卡'
+
+    headers = [
+        '图片名称', '返修卡号', '产品代号', '联系人', '顾客单位', '批次号', '电话号',
+        '返修件名称', '图号', '返修故障件信息', '损坏原因修理结果', 'FRACAS/排故报告编号',
+        '识别时间', '原图',
+    ]
+    header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+    header_font = Font(color='FFFFFF', bold=True, size=10)
+    thin = Side(style='thin', color='B4C6E7')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    align = Alignment(vertical='center', wrap_text=True)
+
+    for col, title in enumerate(headers, start=1):
+        c = ws.cell(row=1, column=col, value=title)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.border = border
+
+    row_vals = [
+        image_name or '',
+        field_map.get('返修卡号', ''),
+        field_map.get('产品代号', ''),
+        field_map.get('联系人', ''),
+        field_map.get('顾客单位', ''),
+        field_map.get('批次号', ''),
+        field_map.get('电话号', ''),
+        field_map.get('返修件名称', ''),
+        field_map.get('图号', ''),
+        field_map.get('返修故障件信息', ''),
+        field_map.get('损坏原因修理结果', ''),
+        field_map.get('FRACAS/排故报告编号', ''),
+        recognition_time or '',
+        '',
+    ]
+    for col, val in enumerate(row_vals, start=1):
+        c = ws.cell(row=2, column=col, value=val)
+        c.alignment = align
+        c.border = border
+
+    from openpyxl.utils import get_column_letter
+    col_widths = [12, 14, 10, 10, 24, 10, 12, 14, 14, 28, 28, 18, 18, 14]
+    for i, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    thumb_path: Optional[str] = None
+    if image_bytes:
+        try:
+            pil = PILImage.open(BytesIO(image_bytes))
+            if pil.mode in ('RGBA', 'P'):
+                pil = pil.convert('RGB')
+            try:
+                resample = PILImage.Resampling.LANCZOS
+            except AttributeError:
+                resample = PILImage.LANCZOS  # type: ignore[attr-defined]
+            pil.thumbnail((480, 360), resample)
+            thumb_path = tempfile.NamedTemporaryFile(delete=False, suffix='.png').name
+            pil.save(thumb_path, 'PNG')
+            xl_img = XLImage(thumb_path)
+            ws.add_image(xl_img, 'N2')
+            ws.row_dimensions[2].height = 200
+        except Exception as e:
+            print(f'[返修卡导出] 嵌入原图失败（仍保存表格）: {e}', flush=True)
     else:
         ws.row_dimensions[2].height = 28
 
@@ -387,14 +493,44 @@ async def ocr_pipeline(
         elapsed = (dt.now() - t0).total_seconds()
         _log(f'✓ Pipeline 完成，耗时 {elapsed:.1f}s，文本块: {len(result.get("ocr_results", []))}')
 
+        # 获取提取的字段（优先使用 FastGPT 增强结果）
+        extracted_fields = result.get("extracted_fields", {})
+
         # 字段列表格式化
         fields_list = _field_result(
-            result.get("extracted_fields", {}),
+            extracted_fields,
             result.get("ocr_results", [])
         )
 
+        # 当启用 FastGPT 时，summary 使用 FastGPT 返回的字段摘要
+        summary = result.get("summary", "")
+        if use_fastgpt and extracted_fields:
+            filled = sum(1 for v in extracted_fields.values() if v)
+            summary = f"FastGPT 增强识别完成，共提取 {filled} 个字段: " + \
+                      ", ".join(f"{k}={v}" for k, v in extracted_fields.items() if v)
+
         # 可选导出（保存到会话目录）
+        # 注意：优先使用 FastGPT 增强后的字段结果
         exports: dict = {}
+
+        # 如果有 FastGPT 增强的字段，先保存一份结构化的字段结果
+        if use_fastgpt and extracted_fields:
+            fastgpt_fields_path = os.path.join(session_dir, f"fastgpt_fields_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+            try:
+                fastgpt_data = {
+                    "source": "fastgpt_enhanced",
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "fields": extracted_fields,
+                    "ocr_text": result.get("summary", ""),
+                }
+                with open(fastgpt_fields_path, 'w', encoding='utf-8') as f:
+                    json.dump(fastgpt_data, f, ensure_ascii=False, indent=2)
+                exports["fastgpt_fields"] = fastgpt_fields_path
+                _log(f'已保存 FastGPT 增强字段: {fastgpt_fields_path}')
+            except Exception as e:
+                _log(f'保存 FastGPT 字段失败: {e}')
+
+        # 表格导出（当有原始表格数据时才导出）
         table = result.get("table")
         if export_format != "none" and table:
             _log(f'正在导出格式: {export_format}')
@@ -403,6 +539,14 @@ async def ocr_pipeline(
             nr = table.get("num_rows", 0)
             nc = table.get("num_cols", 0)
             grid = TableDetector._cells_to_grid(cells, nr, nc) if cells else []
+
+            # 如果使用 FastGPT 且有提取的字段，用 FastGPT 字段构建可导出格式
+            if use_fastgpt and extracted_fields and not cells:
+                # FastGPT 有字段但无原始表格结构，按字段构建简单表格
+                grid = [[field, str(value)] for field, value in extracted_fields.items() if value]
+                nr = len(grid)
+                nc = 2
+
             if grid:
                 base = os.path.join(session_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
                 if export_format == "all":
@@ -417,6 +561,52 @@ async def ocr_pipeline(
                     exports["html"] = TableExporter.to_html(grid, base + ".html")
                 elif export_format == "json":
                     exports["json"] = TableExporter.to_json(grid, base + ".json")
+            elif use_fastgpt and extracted_fields:
+                # 没有原始表格但有 FastGPT 字段时，直接导出字段为 CSV/MD/JSON
+                _log(f'无原始表格，使用 FastGPT 字段导出...')
+                base = os.path.join(session_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+                if export_format in ("csv", "all"):
+                    csv_path = base + ".csv"
+                    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+                        import csv
+                        writer = csv.writer(f)
+                        writer.writerow(["字段名称", "提取内容"])
+                        for field, value in extracted_fields.items():
+                            writer.writerow([field, value])
+                    exports["csv"] = csv_path
+
+                if export_format in ("markdown", "all"):
+                    md_path = base + ".md"
+                    with open(md_path, 'w', encoding='utf-8') as f:
+                        f.write("# OCR 识别结果 (FastGPT 增强)\n\n")
+                        f.write(f"**识别时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                        f.write("| 字段名称 | 提取内容 |\n")
+                        f.write("|---------|----------|\n")
+                        for field, value in extracted_fields.items():
+                            f.write(f"| {field} | {value} |\n")
+                    exports["markdown"] = md_path
+
+                if export_format in ("json", "all"):
+                    json_path = base + ".json"
+                    with open(json_path, 'w', encoding='utf-8') as f:
+                        json.dump({
+                            "source": "fastgpt_enhanced",
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "fields": extracted_fields,
+                        }, f, ensure_ascii=False, indent=2)
+                    exports["json"] = json_path
+
+                if export_format == "excel":
+                    xlsx_path = base + ".xlsx"
+                    import pandas as pd
+                    df = pd.DataFrame([
+                        {"字段名称": f, "提取内容": v}
+                        for f, v in extracted_fields.items()
+                    ])
+                    df.to_excel(xlsx_path, index=False)
+                    exports["excel"] = xlsx_path
+
             _log(f'导出完成: {list(exports.keys())}')
 
         return {
@@ -489,14 +679,34 @@ async def ocr_repair_order(
         t0 = dt.now()
         result = processor.process_image(tmp_path, use_fastgpt=use_fastgpt, fastgpt_config=fastgpt_cfg, output_dir=session_dir)
         elapsed = (dt.now() - t0).total_seconds()
-        _log(f'✓ 识别完成，耗时 {elapsed:.1f}s，文本块: {len(result["ocr_results"])}，字段: {list(result["extracted_fields"].keys())}')
 
-        fields_list = _field_result(result["extracted_fields"], result["ocr_results"])
+        # 记录字段提取来源
+        extracted_fields = result["extracted_fields"]
+        fastgpt_enabled = use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get('api_key'))
+        _log(f'✓ 识别完成，耗时 {elapsed:.1f}s')
+        _log(f'  - 文本块: {len(result["ocr_results"])} 个')
+        _log(f'  - FastGPT 启用: {fastgpt_enabled}')
+        _log(f'  - 提取字段: {extracted_fields}')
+
+        fields_list = _field_result(extracted_fields, result["ocr_results"])
+
+        # 构建原始表格文件路径（PPStructureV3 输出的 JSON 和 HTML）
+        base_name = os.path.splitext(os.path.basename(tmp_path))[0]
+        raw_json_path = os.path.join(session_dir, f"{base_name}.json")
+        raw_html_path = os.path.join(session_dir, f"{base_name}_table.html")
+
         return {
             "success":   True,
             "fields":    fields_list,
             "ocr_count": len(result["ocr_results"]),
             "timestamp": result["timestamp"],
+            # 原始表格文件路径
+            "raw_exports": {
+                "json": raw_json_path if os.path.exists(raw_json_path) else None,
+                "html": raw_html_path if os.path.exists(raw_html_path) else None,
+            },
+            # 新增：FastGPT 使用标记，方便前端判断
+            "fastgpt_used": fastgpt_enabled,
         }
     except Exception as e:
         _log(f'✗ 识别失败: {e}')
@@ -634,49 +844,75 @@ async def export_repair_order(
                     _log(f'⚠ JSON 导出失败: {e}')
 
         else:
-            # 返修卡等：两列竖表
-            CARD_FIELDS = ['返修单号', '故障描述', '送修单位', '返修日期', '技术状态']
-            field_map: dict[str, str] = {}
-            for item in fields_list:
-                f = item.get('field', '')
-                v = item.get('value', '')
-                if f in CARD_FIELDS:
-                    field_map[f] = v
+            # 返修卡：横向一行模板（与调修单类似）或两列竖表
+            field_map = _repair_card_field_map(fields_list)
+            base_card = f"返修卡_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
             if fmt in ('excel', 'all'):
+                _log('正在导出 Excel（返修卡横向模板 + 可选原图）...')
                 try:
-                    import pandas as pd
-                    rows = [[f, field_map.get(f, '')] for f in CARD_FIELDS]
-                    df = pd.DataFrame(rows, columns=['字段名称', '识别内容'])
-                    path = os.path.join(out_root, f"返修卡_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.xlsx")
-                    df.to_excel(path, index=False, header=True)
+                    path = os.path.join(out_root, f"{base_card}.xlsx")
+                    _write_repair_card_excel_template(
+                        path, field_map, image_name, recognition_time, image_bytes,
+                    )
                     exports['excel'] = path
+                    _log(f'✓ Excel: {path}')
                 except Exception as e:
                     _log(f'⚠ 返修卡 Excel 失败: {e}')
+                    traceback.print_exc()
 
             if fmt in ('csv', 'all'):
                 try:
                     import csv
-                    path = os.path.join(out_root, f"返修卡_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv")
+                    path = os.path.join(out_root, f"{base_card}.csv")
+                    headers = [
+                        '图片名称', '返修卡号', '产品代号', '联系人', '顾客单位', '批次号', '电话号',
+                        '返修件名称', '图号', '返修故障件信息', '损坏原因修理结果', 'FRACAS/排故报告编号',
+                        '识别时间', '原图',
+                    ]
+                    row = [
+                        image_name or '',
+                        field_map.get('返修卡号', ''),
+                        field_map.get('产品代号', ''),
+                        field_map.get('联系人', ''),
+                        field_map.get('顾客单位', ''),
+                        field_map.get('批次号', ''),
+                        field_map.get('电话号', ''),
+                        field_map.get('返修件名称', ''),
+                        field_map.get('图号', ''),
+                        field_map.get('返修故障件信息', ''),
+                        field_map.get('损坏原因修理结果', ''),
+                        field_map.get('FRACAS/排故报告编号', ''),
+                        recognition_time,
+                        '(见 Excel 内嵌图)' if image_bytes else '',
+                    ]
                     with open(path, 'w', newline='', encoding='utf-8-sig') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(['字段名称', '识别内容'])
-                        for field in CARD_FIELDS:
-                            writer.writerow([field, field_map.get(field, '')])
+                        w = csv.writer(f)
+                        w.writerow(headers)
+                        w.writerow(row)
                     exports['csv'] = path
+                    _log(f'✓ CSV: {path}')
                 except Exception as e:
                     _log(f'⚠ 返修卡 CSV 失败: {e}')
 
             if fmt in ('json', 'all'):
                 try:
-                    path = os.path.join(out_root, f"返修卡_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json")
+                    export_data = {
+                        'doc_type': '返修卡',
+                        'image_name': image_name,
+                        'recognition_time': recognition_time,
+                        'export_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'fields': {f: field_map.get(f, '') for f in REPAIR_CARD_EXPORT_FIELDS},
+                        'raw_results': fields_list,
+                    }
+                    if image_bytes:
+                        export_data['original_image_base64'] = base64.b64encode(image_bytes).decode('ascii')
+                        export_data['original_image_mime'] = original_image.content_type if original_image else ''
+                    path = os.path.join(out_root, f"{base_card}.json")
                     with open(path, 'w', encoding='utf-8') as f:
-                        json.dump({
-                            'doc_type': '返修卡',
-                            'fields': field_map,
-                            'raw_results': fields_list,
-                        }, f, ensure_ascii=False, indent=2)
+                        json.dump(export_data, f, ensure_ascii=False, indent=2)
                     exports['json'] = path
+                    _log(f'✓ JSON: {path}')
                 except Exception as e:
                     _log(f'⚠ 返修卡 JSON 失败: {e}')
 
@@ -703,36 +939,61 @@ async def ocr_repair_card(
     appid:    str = Form(""),
 ):
     """
-    返修卡 OCR 识别（通用 OCR，提取所有文本行）。
-    返回：{ success, fields: [{key,field,value,confidence}], ocr_count, timestamp }
+    返修卡 OCR：PPStructureV3 版面/表格 + RepairCardParser 字段 + 可选 FastGPT。
+    返回：{ success, fields, ocr_count, timestamp, raw_exports, fastgpt_used }
     """
+    from datetime import datetime as dt
+    import sys
+
+    def _log(msg: str):
+        ts = dt.now().strftime('%H:%M:%S.%f')[:-3]
+        try:
+            print(f"[{ts}] [返修卡API] {msg}", flush=True)
+        except UnicodeEncodeError:
+            for old, new in {'\u2714': '[OK]', '\u2717': '[FAIL]', '\u26a0': '[WARN]'}.items():
+                msg = msg.replace(old, new)
+            print(f"[{ts}] [返修卡API] {msg}", flush=True)
+        sys.stdout.flush()
+
+    _log(f'收到识别请求，文件名: {file.filename}, use_fastgpt={use_fastgpt}')
     tmp_path = _save_upload(file)
     session_dir = _create_session_dir()
+    _log(f'会话目录: {session_dir}')
     try:
         processor = get_ocr_processor()
-        ocr_results = processor.ocr_recognize(tmp_path, output_dir=session_dir)
+        fastgpt_cfg = {"api_url": api_url, "api_key": api_key, "appid": appid} if use_fastgpt else None
+        t0 = dt.now()
+        result = processor.process_repair_card(
+            tmp_path,
+            use_fastgpt=use_fastgpt,
+            fastgpt_config=fastgpt_cfg,
+            output_dir=session_dir,
+        )
+        elapsed = (dt.now() - t0).total_seconds()
 
-        # 返修卡字段关键词匹配
-        CARD_FIELDS = ['返修单号', '故障描述', '送修单位', '返修日期', '技术状态']
-        fields: dict[str, str] = {f: "" for f in CARD_FIELDS}
+        extracted_fields = result["extracted_fields"]
+        fastgpt_enabled = use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get('api_key'))
+        _log(f'✓ 识别完成，耗时 {elapsed:.1f}s，FastGPT={fastgpt_enabled}，字段: {extracted_fields}')
 
-        for item in ocr_results:
-            text = item["text"]
-            for f in CARD_FIELDS:
-                if not fields[f] and f in text:
-                    # 取同行其余内容作为值
-                    val = text.replace(f, "").replace("：", "").replace(":", "").strip()
-                    if val:
-                        fields[f] = val
+        fields_list = _field_result(extracted_fields, result["ocr_results"])
 
-        fields_list = _field_result(fields, ocr_results)
+        base_name = os.path.splitext(os.path.basename(tmp_path))[0]
+        raw_json_path = os.path.join(session_dir, f"{base_name}.json")
+        raw_html_path = os.path.join(session_dir, f"{base_name}_table.html")
+
         return {
             "success":   True,
             "fields":    fields_list,
-            "ocr_count": len(ocr_results),
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ocr_count": len(result["ocr_results"]),
+            "timestamp": result["timestamp"],
+            "raw_exports": {
+                "json": raw_json_path if os.path.exists(raw_json_path) else None,
+                "html": raw_html_path if os.path.exists(raw_html_path) else None,
+            },
+            "fastgpt_used": fastgpt_enabled,
         }
     except Exception as e:
+        _log(f'✗ 识别失败: {e}')
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -982,27 +1243,42 @@ async def export_download(filename: str):
     """
     通用文件下载接口。
     用于下载 OCR 识别结果导出的文件（Excel、HTML、JSON 等）。
-    
+
     参数: filename - 需要下载的文件名（不含路径）
-    
+
     返回: 文件流
     """
     from fastapi.responses import FileResponse
-    
+
     # 获取 output 目录
     output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-    
+
     # 禁止路径遍历
     safe_name = os.path.basename(filename)
     file_path = os.path.join(output_dir, safe_name)
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail=f"文件不存在: {safe_name}")
-    
+
+    # 先尝试直接路径
+    if os.path.exists(file_path):
+        pass  # 找到文件
+    else:
+        # 尝试在 output 的子目录（session_*）中查找
+        found = False
+        if os.path.exists(output_dir):
+            for entry in os.listdir(output_dir):
+                sub_dir = os.path.join(output_dir, entry)
+                if os.path.isdir(sub_dir) and entry.startswith('session_'):
+                    candidate = os.path.join(sub_dir, safe_name)
+                    if os.path.exists(candidate):
+                        file_path = candidate
+                        found = True
+                        break
+        if not found:
+            raise HTTPException(status_code=404, detail=f"文件不存在: {safe_name}")
+
     # 根据扩展名设置媒体类型
     import mimetypes
     media_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
-    
+
     return FileResponse(
         path=file_path,
         filename=safe_name,

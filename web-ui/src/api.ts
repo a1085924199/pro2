@@ -38,6 +38,13 @@ export interface OcrResponse {
   num_rows?:  number
   num_cols?:  number
   exports?:   Record<string, string>
+  /** PPStructureV3 原始表格文件路径 */
+  raw_exports?: {
+    json?: string | null
+    html?: string | null
+  }
+  /** FastGPT 是否被用于增强识别 */
+  fastgpt_used?: boolean
 }
 
 // ─── 健康检查 ────────────────────────────────────────────────
@@ -63,9 +70,9 @@ export async function ocrRepairOrder(
 
 // ─── 调修单结果导出 ──────────────────────────────────────────
 export interface ExportRepairOrderOpts {
-  /** repair_order：横向模板 + 原图；repair_card：两列表格 */
+  /** repair_order：横向模板 + 原图；repair_card：返修卡横向模板 + 末列原图 */
   docType?: 'repair_order' | 'repair_card'
-  /** 原图文件，Excel 嵌入 J 列缩略图 */
+  /** 原图文件，Excel 嵌入缩略图（调修单 J 列 / 返修卡 N 列） */
   imageFile?: File
   /** 对应「图片名称」列 */
   imageName?: string

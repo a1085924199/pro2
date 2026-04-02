@@ -492,7 +492,7 @@ class DocParser:
         if use_fastgpt and fastgpt_config and fastgpt_config.get('api_key'):
             fields = self._extract_fastgpt(ocr_results, fastgpt_config)
         else:
-            fields = self.extract_fields(ocr_results)
+            fields = self.extract_fields(ocr_results, table_regions)
 
         # 生成摘要
         filled = sum(1 for v in fields.values() if v)
@@ -512,21 +512,21 @@ class DocParser:
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
 
-    def extract_fields(self, ocr_results: List[Dict]) -> Dict[str, str]:
+    def extract_fields(self, ocr_results: List[Dict], table_regions: List = None) -> Dict[str, str]:
         return {f: '' for f in self.FIELDS}
 
     def _extract_fastgpt(self, texts: List[Dict], cfg: Dict) -> Dict[str, str]:
         api_url = cfg.get('api_url', '')
         api_key = cfg.get('api_key', '')
         appid   = cfg.get('appid', '')
-        if not api_key:
+        if not api_key or not api_url:
             return self.extract_fields(texts)
         try:
             ocr_text   = '\n'.join(t['text'] for t in texts)
             fields_str = '\n'.join(f'  - {f}' for f in self.FIELDS)
             prompt = (f'你是单据信息提取助手。请从以下OCR文本中提取字段：\n{fields_str}\n\n'
                       f'【OCR文本】\n{ocr_text}\n\n'
-                      f'以JSON数组返回：[{{"field":"字段名","value":"内容"}}]，未找到填空字符串。只返回JSON数组。')
+                      f'以JSON对象返回，键为字段名，值为提取内容，未找到填空字符串。只返回JSON对象。')
             resp = requests.post(
                 api_url,
                 headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
@@ -537,16 +537,42 @@ class DocParser:
                 timeout=30)
             if resp.status_code == 200:
                 content = resp.json().get('choices',[{}])[0].get('message',{}).get('content','')
-                m = re.search(r'\[.*\]', content, re.DOTALL)
+                m = re.search(r'\{[\s\S]*\}', content, re.DOTALL)
                 if m:
                     result = {f: '' for f in self.FIELDS}
-                    for item in json.loads(m.group()):
-                        fn = item.get('field','')
-                        if fn in result: result[fn] = item.get('value','')
+                    try:
+                        parsed = json.loads(m.group())
+                        if isinstance(parsed, dict):
+                            for fn, val in parsed.items():
+                                if fn in result: result[fn] = str(val) if val else ''
+                        elif isinstance(parsed, list):
+                            for item in parsed:
+                                fn = item.get('field', '')
+                                if fn in result: result[fn] = item.get('value', '')
+                    except json.JSONDecodeError:
+                        pass
                     return result
         except Exception as e:
             print(f'FastGPT调用失败({self.__class__.__name__}): {e}')
-        return self.extract_fields(texts)
+        # 超时或解析失败时回退到规则提取（传入完整 OCR 文本供匹配）
+        fallback_fields = self.extract_fields(texts, table_regions=None)
+        # 再尝试从 OCR 全文补充未填字段
+        full_text = '\n'.join(t['text'] for t in texts)
+        for fn, val in fallback_fields.items():
+            if not val:
+                if fn == 'FRACAS/排故报告编号':
+                    m = re.search(r'(FRA[A-Z0-9]{6,})', full_text, re.IGNORECASE)
+                    if m:
+                        fallback_fields[fn] = m.group(1).upper()
+                elif fn == '电话号':
+                    m = re.search(r'(1[3-9]\d{9})', full_text)
+                    if m:
+                        fallback_fields[fn] = m.group(1)
+                elif fn == '图号':
+                    m = re.search(r'(AL[\d\.\s]+\d{3})', full_text, re.IGNORECASE)
+                    if m:
+                        fallback_fields[fn] = re.sub(r'\s+', ' ', m.group(1).strip())
+        return fallback_fields
 
     @staticmethod
     def _find_nearest(label_item, candidates, max_x_gap=600, max_y_gap=40):
@@ -570,7 +596,7 @@ class DocParser:
 class RepairOrderParser(DocParser):
     FIELDS = ['调修单号','装备型号','器材名称','型（图）号','器件编号','邮寄地址','进厂时间']
 
-    def extract_fields(self, ocr_results):
+    def extract_fields(self, ocr_results, table_regions=None):
         fields = {f:'' for f in self.FIELDS}
         texts  = sorted(ocr_results, key=lambda t: t['bbox'][1] if len(t.get('bbox',[]))==4 else 0)
         F = self._find_nearest
@@ -619,17 +645,182 @@ class RepairOrderParser(DocParser):
 
 # ── 返修卡解析器 ──────────────────────────────────────────────────────────────
 class RepairCardParser(DocParser):
-    FIELDS = ['返修单号','故障描述','送修单位','返修日期','技术状态']
+    """
+    返修件维修卡字段（与 FastGPT 提示一致）。
+    重要：返修卡号优先从表头 NO.xxxx 提取。
+    """
+    FIELDS = [
+        '返修卡号', '产品代号', '联系人', '顾客单位', '批次号', '电话号',
+        '返修件名称', '图号', '返修故障件信息', '损坏原因修理结果', 'FRACAS/排故报告编号',
+    ]
 
-    def extract_fields(self, ocr_results):
-        fields = {f:'' for f in self.FIELDS}
-        texts  = sorted(ocr_results, key=lambda t: t['bbox'][1] if len(t.get('bbox',[]))==4 else 0)
-        for item in texts:
-            t = item['text']
-            for f in self.FIELDS:
-                if not fields[f] and f in t:
-                    val = t.replace(f,'').replace('：','').replace(':','').strip()
-                    fields[f] = val if val else (self._find_nearest(item,texts) or {}).get('text','')
+    def extract_fields(self, ocr_results, table_regions=None):
+        fields = {f: '' for f in self.FIELDS}
+        texts = [t for t in ocr_results if t.get('text', '').strip()]
+        full_text = '\n'.join(t['text'] for t in texts)
+        F = self._find_nearest
+
+        # ── 表格行列结构提取（优先）─────────────────────────────────────────────
+        def _table_value(table_regions, keywords: list) -> str:
+            """根据标签关键词在表格单元格中查找对应的值（右侧相邻列或下一行）"""
+            for tr in (table_regions or []):
+                for cell in tr.get('cells', []):
+                    cell_text = cell.get('text', '').strip()
+                    if not cell_text:
+                        continue
+                    # 匹配标签
+                    for kw in keywords:
+                        if kw in cell_text:
+                            row, col = cell['row'], cell['col']
+                            # 找同行下一列
+                            for c in tr.get('cells', []):
+                                if c['row'] == row and c['col'] == col + 1:
+                                    val = c.get('text', '').strip()
+                                    if val and '产品代号' not in val and '联系人' not in val and \
+                                       '任务' not in val and '批次' not in val and '电话' not in val and \
+                                       '返修件名称' not in val and '图号' not in val and \
+                                       '数量' not in val and '#' not in val:
+                                        return val
+                            # 找同列下一行
+                            for c in tr.get('cells', []):
+                                if c['row'] == row + 1 and c['col'] == col:
+                                    return c.get('text', '').strip()
+            return ''
+
+        def _table_row_value(table_regions, label_keywords: list, max_next_cols=5) -> str:
+            """取标签所在行右侧若干列拼接成值（跨列大字段，如故障信息）"""
+            for tr in (table_regions or []):
+                for cell in tr.get('cells', []):
+                    cell_text = cell.get('text', '').strip()
+                    for kw in label_keywords:
+                        if kw in cell_text:
+                            row, col = cell['row'], cell['col']
+                            parts = []
+                            for c in tr.get('cells', []):
+                                if c['row'] == row and c['col'] >= col + 1:
+                                    t = c.get('text', '').strip()
+                                    if t and '#' not in t:
+                                        parts.append(t)
+                            if parts:
+                                return ' '.join(parts)
+            return ''
+
+        def _table_no_value(texts) -> str:
+            """从 OCR 文本（非表格单元格）中找返修卡号 NO.xxxx"""
+            for pat in (r'NO[\.\s．]*(\d{4,})', r'[Nn][Oo][\.\s．]*(\d{4,})', r'返修卡号[：:\s]*(\d+)', r'卡号[：:\s]*(\d{4,})'):
+                m = re.search(pat, full_text)
+                if m:
+                    return m.group(1).strip()
+            return ''
+
+        def _table_fault_block(texts) -> str:
+            """找含「返修故障」关键词的大段文字块（多行合并）"""
+            lines = [t['text'].strip() for t in texts]
+            for i, line in enumerate(lines):
+                if '返修故障' in line or '损坏原因' in line:
+                    parts = [line]
+                    for j in range(i + 1, min(i + 8, len(lines))):
+                        lj = lines[j]
+                        if any(k in lj for k in ('FRACAS', '维修人员', '排故报告', '修理结果：', '维修部门')) and j > i:
+                            break
+                        if lj and lj not in ('1', '2', '3', '4', '5'):
+                            parts.append(lj)
+                    return ' '.join(parts)[:2000]
+            return ''
+
+        # 逐字段从表格提取
+        if not fields['返修卡号']:
+            fields['返修卡号'] = _table_no_value(texts)
+
+        if not fields['产品代号']:
+            v = _table_value(table_regions, ['产品代号'])
+            if not v:
+                # 找「产品代号」标签右侧的非标签值
+                for tr in (table_regions or []):
+                    for cell in tr.get('cells', []):
+                        if cell.get('text', '').strip() == '产品代号':
+                            row, col = cell['row'], cell['col']
+                            for c in tr.get('cells', []):
+                                if c['row'] == row and c['col'] == col + 1:
+                                    val = c.get('text', '').strip()
+                                    if val and val not in ('联系人', '顾客单位', '批次号', '电话', '返修件名称', '图号'):
+                                        fields['产品代号'] = val
+                                        break
+            else:
+                fields['产品代号'] = v
+
+        if not fields['联系人']:
+            for tr in (table_regions or []):
+                for cell in tr.get('cells', []):
+                    if cell.get('text', '').strip() == '联系人':
+                        row, col = cell['row'], cell['col']
+                        for c in tr.get('cells', []):
+                            if c['row'] == row and c['col'] == col + 1:
+                                val = c.get('text', '').strip()
+                                if val and '任务' not in val and val not in ('产品代号', '顾客单位', '批次号', '电话', '返修件名称', '图号', '数量'):
+                                    fields['联系人'] = val
+                                    break
+                        break
+
+        if not fields['顾客单位']:
+            v = _table_value(table_regions, ['顾客单位', '客户单位'])
+            if v:
+                fields['顾客单位'] = v
+
+        if not fields['批次号']:
+            v = _table_value(table_regions, ['批次号'])
+            if v:
+                fields['批次号'] = re.sub(r'\D', '', v) or v
+
+        if not fields['电话号']:
+            v = _table_value(table_regions, ['电话', '电话号', '手机号'])
+            if not v:
+                m = re.search(r'(1[3-9]\d{9})', full_text)
+                if m:
+                    fields['电话号'] = m.group(1)
+            else:
+                fields['电话号'] = v
+
+        if not fields['返修件名称']:
+            v = _table_value(table_regions, ['返修件名称', '名称'])
+            if v:
+                fields['返修件名称'] = v
+
+        if not fields['图号']:
+            v = _table_value(table_regions, ['图号'])
+            if not v:
+                m = re.search(r'(AL[\d\.\s]+\d{3})', full_text, re.IGNORECASE)
+                if m:
+                    fields['图号'] = re.sub(r'\s+', ' ', m.group(1).strip())
+            else:
+                fields['图号'] = v
+
+        if not fields['返修故障件信息']:
+            v = _table_row_value(table_regions, ['返修故障件信息', '返修故障', '故障件信息'])
+            if not v:
+                v = _table_fault_block(texts)
+            if v:
+                fields['返修故障件信息'] = v
+
+        if not fields['FRACAS/排故报告编号']:
+            m = re.search(r'(FRA[A-Z0-9]{6,})', full_text, re.IGNORECASE)
+            if m:
+                fields['FRACAS/排故报告编号'] = m.group(1).upper()
+            # 也从表格找
+            if not fields['FRACAS/排故报告编号']:
+                for tr in (table_regions or []):
+                    for cell in tr.get('cells', []):
+                        ct = cell.get('text', '').strip()
+                        if 'FRACAS' in ct or '排故' in ct or '报告编号' in ct:
+                            row, col = cell['row'], cell['col']
+                            for c in tr.get('cells', []):
+                                if c['row'] == row and c['col'] > col:
+                                    val = c.get('text', '').strip()
+                                    if val and val not in ('维修部门', '装备部'):
+                                        fields['FRACAS/排故报告编号'] = val
+                                        break
+                            break
+
         return fields
 
 
@@ -643,7 +834,7 @@ class MaterialParser(DocParser):
         self.doc_type = doc_type
         self.FIELDS   = self.FIELDS_OUT if doc_type == 'out' else self.FIELDS_IN
 
-    def extract_fields(self, ocr_results):
+    def extract_fields(self, ocr_results, table_regions=None):
         fields = {f:'' for f in self.FIELDS}
         for item in ocr_results:
             t = item['text']
@@ -805,7 +996,7 @@ class OCRPipeline:
                 _log(f'[OCRPipeline]   正在使用 FastGPT 增强字段提取...')
                 extracted_fields = parser._extract_fastgpt(ocr_results, kwargs.get('fastgpt_config'))
             else:
-                extracted_fields = parser.extract_fields(ocr_results)
+                extracted_fields = parser.extract_fields(ocr_results, table_regions)
             _log(f'[OCRPipeline]   字段提取完成: {extracted_fields}')
         _log(f'[OCRPipeline] ✓ 阶段 5/5 完成，耗时 {time.time()-t0:.1f}s')
 
@@ -873,6 +1064,17 @@ class RepairOrderOCR:
         return OCRPipeline.process(
             image_path,
             task_type=OCRTask.REPAIR_ORDER,
+            use_fastgpt=use_fastgpt,
+            fastgpt_config=fastgpt_config,
+            output_dir=output_dir or 'output'
+        )
+
+    def process_repair_card(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None) -> Dict:
+        """处理返修卡图像（PPStructureV3 + RepairCardParser 字段 + 可选 FastGPT）"""
+        from ocr_core import OCRPipeline, OCRTask
+        return OCRPipeline.process(
+            image_path,
+            task_type=OCRTask.REPAIR_CARD,
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_config,
             output_dir=output_dir or 'output'

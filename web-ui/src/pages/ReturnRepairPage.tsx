@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Steps, Button, Tag, Divider, Switch, Input, message } from 'antd'
+import { Steps, Button, Tag, Divider, Switch, Input, message, Dropdown } from 'antd'
 import {
   ScanOutlined,
   FileSearchOutlined,
@@ -11,6 +11,9 @@ import {
   SaveOutlined,
   ThunderboltOutlined,
   DownloadOutlined,
+  FileTextOutlined,
+  FileExcelOutlined,
+  CloudOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import UploadZone from '../components/UploadZone'
@@ -43,10 +46,17 @@ interface StepState {
   cachedFields?: FieldResult[]  // 缓存识别结果，供导出使用
   /** OCR 返回的识别时间，写入导出表「识别时间」列 */
   recognizedAt?: string
+  /** PPStructureV3 原始表格文件路径 */
+  rawExports?: {
+    json?: string | null
+    html?: string | null
+  }
+  /** FastGPT 是否被用于增强识别 */
+  fastgptUsed?: boolean
 }
 
 function initState(): StepState {
-  return { status: 'idle', files: [], results: [], info: '', progress_detail: '', cachedFields: undefined, recognizedAt: undefined }
+  return { status: 'idle', files: [], results: [], info: '', progress_detail: '', cachedFields: undefined, recognizedAt: undefined, rawExports: undefined, fastgptUsed: undefined }
 }
 
 const EMPTY_FGPT: StepFastgptConfig = { api_url: '', api_key: '', appid: '', enabled: false }
@@ -207,6 +217,8 @@ export default function ReturnRepairPage() {
         recognizedAt: resp.timestamp,
         info: `识别 ${resp.ocr_count} 个文本块 · ${resp.timestamp}`,
         progress_detail: '',
+        rawExports: resp.raw_exports,
+        fastgptUsed: resp.fastgpt_used,
       })
       messageApi.success(`步骤 ${idx + 1} 识别完成`)
     } catch (e: unknown) {
@@ -234,7 +246,12 @@ export default function ReturnRepairPage() {
               imageName: state.files[0]?.name ?? '',
               recognitionTime: state.recognizedAt ?? '',
             }
-          : { docType: 'repair_card' as const }
+          : {
+              docType: 'repair_card' as const,
+              imageFile: state.files[0],
+              imageName: state.files[0]?.name ?? '',
+              recognitionTime: state.recognizedAt ?? '',
+            }
       const resp = await exportRepairOrder(fields, fmt, exportOpts)
       const exports = resp.exports ?? {}
       if (Object.keys(exports).length > 0) {
@@ -252,6 +269,18 @@ export default function ReturnRepairPage() {
       const msg = e instanceof Error ? e.message : String(e)
       messageApi.error(`导出失败：${msg}`)
     }
+  }
+
+  // 下载原始表格文件（JSON/HTML）
+  const handleExportRaw = async (idx: number, type: 'json' | 'html') => {
+    const state = stepStates[idx]
+    const rawPath = type === 'json' ? state.rawExports?.json : state.rawExports?.html
+    if (!rawPath) {
+      messageApi.warning('没有可下载的原始表格文件')
+      return
+    }
+    const filename = rawPath.split(/[\\/]/).pop() || `raw_table.${type}`
+    downloadExportFile(filename)
   }
 
   const step  = STEPS[current]
@@ -292,7 +321,7 @@ export default function ReturnRepairPage() {
       <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.15 }}
         style={{ background: '#161b22', border: '1px solid #21262d', borderRadius: 14, padding: '28px 32px', marginBottom: 32 }}>
         <Steps current={current} items={antStepItems}
-          onChange={(i) => { if (stepStates[i].status === 'done' || i <= current) setCurrent(i) }} />
+          onChange={(i) => setCurrent(i)} />
       </motion.div>
 
       {/* 当前步骤内容 */}
@@ -355,6 +384,8 @@ export default function ReturnRepairPage() {
                       results: [],
                       cachedFields: undefined,
                       recognizedAt: undefined,
+                      rawExports: undefined,
+                      fastgptUsed: undefined,
                     })
                   }
                   multiple={false}
@@ -436,33 +467,82 @@ export default function ReturnRepairPage() {
                 <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }}>
                   <Divider style={{ borderColor: '#21262d', margin: '0 0 16px' }} />
                   {state.info && <p style={{ color: '#7d8590', fontSize: 12, marginBottom: 12 }}>{state.info}</p>}
-                  {/* 调修单/返修卡专属导出按钮组 */}
+                  {/* 调修单/返修卡专属导出按钮组（与通用表格识别一致的样式） */}
                   {current < 2 && (
-                    <div className="flex gap-2 mb-4">
-                      <Button
-                        size="small"
-                        icon={<DownloadOutlined />}
-                        onClick={() => handleExport(current, 'excel')}
-                        style={{ background: '#1f883d', borderColor: '#1f883d', color: '#fff' }}
+                    <div className="flex gap-2 mb-4 items-center flex-wrap">
+                      {/* 识别结果导出：使用 FastGPT 提取的字段 + 原图 */}
+                      <Dropdown
+                        menu={{
+                          items: [
+                            {
+                              key: 'excel',
+                              icon: <FileExcelOutlined />,
+                              label: '导出 Excel (.xlsx)',
+                              onClick: () => handleExport(current, 'excel'),
+                            },
+                            {
+                              key: 'csv',
+                              icon: <FileTextOutlined />,
+                              label: '导出 CSV (.csv)',
+                              onClick: () => handleExport(current, 'csv'),
+                            },
+                            {
+                              key: 'json',
+                              icon: <CloudOutlined />,
+                              label: '导出 JSON (.json)',
+                              onClick: () => handleExport(current, 'json'),
+                            },
+                            { type: 'divider' as const },
+                            {
+                              key: 'all',
+                              icon: <DownloadOutlined />,
+                              label: '导出全部格式',
+                              onClick: () => handleExport(current, 'all'),
+                            },
+                          ],
+                        }}
+                        trigger={['click']}
+                        placement="bottomLeft"
                       >
-                        导出 Excel
-                      </Button>
-                      <Button
-                        size="small"
-                        icon={<DownloadOutlined />}
-                        onClick={() => handleExport(current, 'csv')}
-                        style={{ background: '#1c2128', borderColor: '#30363d', color: '#e6edf3' }}
+                        <Button
+                          icon={<DownloadOutlined />}
+                          style={{ background: '#1f883d', borderColor: '#1f883d', color: '#fff' }}
+                        >
+                          识别结果导出
+                        </Button>
+                      </Dropdown>
+
+                      {/* 原表输出：PPStructureV3 原始表格 */}
+                      <Dropdown
+                        menu={{
+                          items: [
+                            {
+                              key: 'raw_json',
+                              icon: <CloudOutlined />,
+                              label: 'JSON (.json)',
+                              onClick: () => handleExportRaw(current, 'json'),
+                              disabled: !state.rawExports?.json,
+                            },
+                            {
+                              key: 'raw_html',
+                              icon: <FileTextOutlined />,
+                              label: 'HTML (.html)',
+                              onClick: () => handleExportRaw(current, 'html'),
+                              disabled: !state.rawExports?.html,
+                            },
+                          ],
+                        }}
+                        trigger={['click']}
+                        placement="bottomLeft"
                       >
-                        导出 CSV
-                      </Button>
-                      <Button
-                        size="small"
-                        icon={<DownloadOutlined />}
-                        onClick={() => handleExport(current, 'json')}
-                        style={{ background: '#1c2128', borderColor: '#30363d', color: '#e6edf3' }}
-                      >
-                        导出 JSON
-                      </Button>
+                        <Button
+                          icon={<DownloadOutlined />}
+                          style={{ background: '#21262d', borderColor: '#30363d', color: '#e6edf3' }}
+                          disabled={!state.rawExports?.json && !state.rawExports?.html}
+                        >
+                          原表输出
+                        </Button>
+                      </Dropdown>
                     </div>
                   )}
                   <ResultTable
