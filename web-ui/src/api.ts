@@ -27,12 +27,16 @@ export interface FieldResult {
 }
 
 export interface OcrResponse {
-  success: boolean
-  fields: FieldResult[]
-  ocr_count: number
-  timestamp: string
-  raw_text?: string
+  success:    boolean
+  fields:     FieldResult[]
+  ocr_count:  number
+  timestamp:  string
+  raw_text?:  string
   table_html?: string
+  cells?:     Array<{row: number; col: number; text: string; confidence: number}>
+  num_rows?:  number
+  num_cols?:  number
+  exports?:   Record<string, string>
 }
 
 // ─── 健康检查 ────────────────────────────────────────────────
@@ -119,6 +123,22 @@ export async function ocrGeneral(
   form.append('mode', mode)
   form.append('export_format', exportFormat)
   const res = await ocrApi.post('/ocr/general', form)
+  return res.data
+}
+
+// ─── 专用导出接口（不重跑 OCR，只转换格式）──────────────────────
+export async function ocrExportFormat(
+  cells:   Array<{row: number; col: number; text: string; confidence: number}>,
+  numRows: number,
+  numCols: number,
+  fmt: 'excel' | 'csv' | 'markdown' | 'html' | 'json' | 'all',
+): Promise<{ success: boolean; exports: Record<string, string>; timestamp: string }> {
+  const form = new FormData()
+  form.append('cells',    JSON.stringify(cells))
+  form.append('num_rows', String(numRows))
+  form.append('num_cols', String(numCols))
+  form.append('fmt',      fmt)
+  const res = await api.post('/ocr/export-format', form)
   return res.data
 }
 

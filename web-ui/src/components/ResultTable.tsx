@@ -1,4 +1,4 @@
-import { Table, Tag, Button, Space } from 'antd'
+import { Table, Tag, Button } from 'antd'
 import { DownloadOutlined, CopyOutlined } from '@ant-design/icons'
 import { motion } from 'framer-motion'
 import type { ColumnType } from 'antd/es/table'

@@ -42,10 +42,8 @@ export default function UploadZone({
 
   return (
     <div className="flex flex-col gap-3">
-      <motion.div
+      <div
         {...getRootProps()}
-        whileHover={{ scale: 1.005 }}
-        whileTap={{ scale: 0.998 }}
         style={{
           border: `2px dashed ${isDragActive ? '#3378ff' : '#30363d'}`,
           borderRadius: 12,
@@ -53,7 +51,7 @@ export default function UploadZone({
           textAlign: 'center',
           cursor: 'pointer',
           background: isDragActive ? 'rgba(51,120,255,0.06)' : '#161b22',
-          transition: 'all 0.2s',
+          transition: 'all 0.2s, border-color 0.2s, background 0.2s, transform 0.15s',
           position: 'relative',
           overflow: 'hidden',
         }}
@@ -95,7 +93,7 @@ export default function UploadZone({
           </p>
           <p style={{ color: '#484f58', fontSize: 13, margin: '6px 0 0' }}>{hint}</p>
         </motion.div>
-      </motion.div>
+      </div>
 
       {/* File list */}
       <AnimatePresence>

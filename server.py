@@ -12,11 +12,7 @@ server.py - FastAPI OCR 后端服务 v2.0
   POST /api/ocr/repair-card       - 返修卡 OCR 识别
   POST /api/ocr/material          - 航材出入库单识别
   POST /api/ocr/general           - 通用文档/表格 OCR 识别
-  POST /api/ocr/inspection-report - 检验报告单识别
-  POST /api/ocr/maintenance-record- 维修记录单识别
-  POST /api/ocr/quotation         - 报价单识别
   POST /api/ocr/table-structure   - PP-Structure 表格识别
-  POST /api/ocr/table-advanced    - 三阶段线检测表格识别
   GET  /api/health                - 健康检查
   GET  /api/config/fastgpt        - 读取 FastGPT 配置
   POST /api/config/fastgpt        - 保存 FastGPT 配置
@@ -27,7 +23,7 @@ import shutil
 import tempfile
 import traceback
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional
 
 # 离线模式，禁用联网检查
 os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
@@ -109,6 +105,23 @@ def _cleanup(*paths: str):
             os.unlink(p)
         except Exception:
             pass
+def _get_output_dir() -> str:
+    """获取 output 目录路径"""
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _create_session_dir() -> str:
+    """
+    创建一个以时间戳命名的新会话目录，用于存放本次识别的所有输出文件。
+    目录名格式：session_YYYYMMDD_HHMMSS_ffffff
+    """
+    output_dir = _get_output_dir()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    session_dir = os.path.join(output_dir, f"session_{timestamp}")
+    os.makedirs(session_dir, exist_ok=True)
+    return session_dir
 
 
 def _field_result(fields: dict, ocr_results: list) -> dict:
@@ -230,6 +243,8 @@ async def ocr_pipeline(
              ocr_count, table_regions, summary, exports, timestamp }
     """
     tmp_path = _save_upload(file)
+    # 创建独立会话目录，存放本次识别的所有文件
+    session_dir = _create_session_dir()
     try:
         from ocr_core import OCRPipeline
         fastgpt_cfg = (
@@ -242,6 +257,7 @@ async def ocr_pipeline(
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_cfg,
             doc_type=doc_type,
+            output_dir=session_dir,
         )
 
         # 字段列表格式化
@@ -250,7 +266,7 @@ async def ocr_pipeline(
             result.get("ocr_results", [])
         )
 
-        # 可选导出
+        # 可选导出（保存到会话目录）
         exports: dict = {}
         table = result.get("table")
         if export_format != "none" and table:
@@ -260,8 +276,7 @@ async def ocr_pipeline(
             nc = table.get("num_cols", 0)
             grid = TableDetector._cells_to_grid(cells, nr, nc) if cells else []
             if grid:
-                import tempfile
-                base = tempfile.mktemp(prefix="ocr_export_")
+                base = os.path.join(session_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
                 if export_format == "all":
                     exports = TableExporter.export_all(grid, base)
                 elif export_format == "excel":
@@ -317,10 +332,11 @@ async def ocr_repair_order(
     返回：{ success, fields: [{key,field,value,confidence}], ocr_count, timestamp }
     """
     tmp_path = _save_upload(file)
+    session_dir = _create_session_dir()
     try:
         processor = get_ocr_processor()
         fastgpt_cfg = {"api_url": api_url, "api_key": api_key, "appid": appid} if use_fastgpt else None
-        result = processor.process_image(tmp_path, use_fastgpt=use_fastgpt, fastgpt_config=fastgpt_cfg)
+        result = processor.process_image(tmp_path, use_fastgpt=use_fastgpt, fastgpt_config=fastgpt_cfg, output_dir=session_dir)
 
         fields_list = _field_result(result["extracted_fields"], result["ocr_results"])
         return {
@@ -349,9 +365,10 @@ async def ocr_repair_card(
     返回：{ success, fields: [{key,field,value,confidence}], ocr_count, timestamp }
     """
     tmp_path = _save_upload(file)
+    session_dir = _create_session_dir()
     try:
         processor = get_ocr_processor()
-        ocr_results = processor.ocr_recognize(tmp_path)
+        ocr_results = processor.ocr_recognize(tmp_path, output_dir=session_dir)
 
         # 返修卡字段关键词匹配
         CARD_FIELDS = ['返修单号', '故障描述', '送修单位', '返修日期', '技术状态']
@@ -390,9 +407,10 @@ async def ocr_material(
     返回：{ success, fields, ocr_count, timestamp }
     """
     tmp_path = _save_upload(file)
+    session_dir = _create_session_dir()
     try:
         processor = get_ocr_processor()
-        ocr_results = processor.ocr_recognize(tmp_path)
+        ocr_results = processor.ocr_recognize(tmp_path, output_dir=session_dir)
 
         if doc_type == "out":
             TARGET = ['出库单号', '航材名称', '航材型号', '数量', '出库日期', '经手人', '领用单位', '备注']
@@ -435,48 +453,41 @@ async def ocr_general(
     返回：{ success, fields, raw_text, table_html, ocr_count, exports, timestamp }
     """
     tmp_path = _save_upload(file)
+    # 创建独立会话目录，存放本次识别的所有文件
+    session_dir = _create_session_dir()
     try:
-        processor = get_ocr_processor()
-        ocr_results = processor.ocr_recognize(tmp_path)
+        from ocr_core import OCRPipeline, OCRTask, TableDetector, TableExporter
+
+        # 统一流水线：一次调用获取 OCR 结果 + 表格结构
+        pipeline_result = OCRPipeline.process(
+            tmp_path,
+            task_type=OCRTask.TABLE if mode == "table" else OCRTask.GENERAL,
+            output_dir=session_dir,
+        )
+        ocr_results = pipeline_result.get("ocr_results", [])
+        table_data = pipeline_result.get("table", {})
 
         raw_text = " | ".join(item["text"] for item in ocr_results)
         summary = f"已识别 {len(ocr_results)} 个文本块，共 {len(raw_text)} 字符。"
 
         table_html = ""
         exports: dict = {}
-        if mode == "table":
-            from ocr_core import _build_table_from_textboxes, TableExporter, TableDetector
-            table = _build_table_from_textboxes(ocr_results)
-            cells = table.get("cells", []) if table else []
-            table_html = table.get("html", "") if table else ""
-            num_rows = table.get("num_rows", 0) if table else 0
-            num_cols = table.get("num_cols", 0) if table else 0
-            
-            # 若纯 OCR 结构化无效，尝试三阶段线检测
-            if not cells or num_rows == 0 or num_cols == 0:
-                try:
-                    print("[OCRPipeline] 纯 OCR 结构化失败，尝试三阶段线检测...")
-                    det_result = TableDetector.process(tmp_path)
-                    if det_result and det_result.get("num_rows", 0) > 0 and det_result.get("num_cols", 0) > 0:
-                        table = det_result
-                        cells = det_result.get("cells", [])
-                        table_html = det_result.get("html", "")
-                        num_rows = det_result.get("num_rows", 0)
-                        num_cols = det_result.get("num_cols", 0)
-                        print("[OCRPipeline] 三阶段线检测成功")
-                except Exception as e:
-                    print(f"[OCRPipeline] 三阶段线检测失败: {e}")
-            
+        cells = table_data.get("cells", [])
+        num_rows = table_data.get("num_rows", 0)
+        num_cols = table_data.get("num_cols", 0)
+        if mode == "table" and cells:
+            table_html = table_data.get("html", "")
+
             fields_list = [
                 {
                     "key":        f"r{c['row']}c{c['col']}",
                     "field":      f"第{c['row']+1}行 第{c['col']+1}列",
                     "value":      c["text"],
-                    "confidence": c["confidence"],
+                    "confidence": c.get("confidence", 1.0),
                 }
                 for c in cells
             ]
-            
+
             if cells and num_rows > 0 and num_cols > 0:
                 summary = f"已识别表格结构，共 {num_rows} 行 × {num_cols} 列，{len(cells)} 个单元格。"
             elif ocr_results:
@@ -485,10 +496,9 @@ async def ocr_general(
                 summary = "未检测到任何内容。"
 
             # ── 多格式导出 ──────────────────────────────────────────────────
-            if export_format != "none" and table and cells:
-                import tempfile
+            if export_format != "none" and cells:
                 grid = TableDetector._cells_to_grid(cells, num_rows, num_cols)
-                base = tempfile.mktemp(prefix="ocr_general_")
+                base = os.path.join(session_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
                 if export_format == "all":
                     exports = TableExporter.export_all(grid, base)
                 elif export_format == "excel":
@@ -519,6 +529,9 @@ async def ocr_general(
             "raw_text":   summary,
             "table_html": table_html,
             "ocr_count":  len(ocr_results),
+            "cells":      cells,
+            "num_rows":   num_rows,
+            "num_cols":   num_cols,
             "exports":    exports,
             "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -529,100 +542,66 @@ async def ocr_general(
         _cleanup(tmp_path)
 
 
-@app.post("/api/ocr/inspection-report")
-async def ocr_inspection_report(
-    file: UploadFile = File(...),
-    use_fastgpt: bool = Form(False),
-    api_url:  str = Form(""),
-    api_key:  str = Form(""),
-    appid:    str = Form(""),
+@app.post("/api/ocr/export-format")
+async def ocr_export_format(
+    cells:   str = Form(""),
+    num_rows: int = Form(0),
+    num_cols: int = Form(0),
+    fmt:      str = Form("excel"),
 ):
     """
-    检验报告单 OCR 识别。
-    返回：{ success, fields: [{key,field,value,confidence}], ocr_count, timestamp }
+    专用导出接口：接收前端缓存的识别结果（cells），只做格式转换，不执行 OCR。
+    用于已识别过的表格，直接导出多格式文件，避免重复识别。
+
+    参数:
+        cells   - JSON 字符串化的 cells 列表
+        num_rows- 表格行数
+        num_cols- 表格列数
+        fmt     - excel|csv|markdown|html|json|all
+
+    返回: { success, exports: {fmt: file_path}, timestamp }
     """
-    tmp_path = _save_upload(file)
+    # 创建独立会话目录
+    session_dir = _create_session_dir()
     try:
-        from ocr_core import InspectionReportParser
-        parser = InspectionReportParser()
-        fastgpt_cfg = {"api_url": api_url, "api_key": api_key, "appid": appid} if use_fastgpt else None
-        result = parser.parse(tmp_path, use_fastgpt=use_fastgpt, fastgpt_config=fastgpt_cfg)
-        fields_list = _field_result(result["extracted_fields"], result["ocr_results"])
+        from ocr_core import TableDetector, TableExporter
+
+        if not cells or num_rows <= 0 or num_cols <= 0:
+            raise HTTPException(status_code=400, detail="cells 或行列数参数无效")
+
+        cells_list: List[Dict] = json.loads(cells)
+        grid = TableDetector._cells_to_grid(cells_list, num_rows, num_cols)
+        if not grid:
+            raise HTTPException(status_code=400, detail="无法从 cells 构建表格网格")
+
+        base = os.path.join(session_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+        exports: Dict[str, str] = {}
+        if fmt == "all":
+            exports = TableExporter.export_all(grid, base)
+        elif fmt == "excel":
+            exports["excel"] = TableExporter.to_excel(grid, base + ".xlsx")
+        elif fmt == "csv":
+            exports["csv"] = TableExporter.to_csv(grid, base + ".csv")
+        elif fmt == "markdown":
+            exports["markdown"] = TableExporter.to_markdown(grid, base + ".md")
+        elif fmt == "html":
+            exports["html"] = TableExporter.to_html(grid, base + ".html")
+        elif fmt == "json":
+            exports["json"] = TableExporter.to_json(grid, base + ".json")
+        else:
+            raise HTTPException(status_code=400, detail=f"不支持的导出格式: {fmt}")
+
         return {
             "success":   True,
-            "fields":    fields_list,
-            "ocr_count": len(result["ocr_results"]),
-            "timestamp": result["timestamp"],
+            "exports":   exports,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        _cleanup(tmp_path)
-
-
-@app.post("/api/ocr/maintenance-record")
-async def ocr_maintenance_record(
-    file: UploadFile = File(...),
-    use_fastgpt: bool = Form(False),
-    api_url:  str = Form(""),
-    api_key:  str = Form(""),
-    appid:    str = Form(""),
-):
-    """
-    维修记录单 OCR 识别。
-    返回：{ success, fields: [{key,field,value,confidence}], ocr_count, timestamp }
-    """
-    tmp_path = _save_upload(file)
-    try:
-        from ocr_core import MaintenanceRecordParser
-        parser = MaintenanceRecordParser()
-        fastgpt_cfg = {"api_url": api_url, "api_key": api_key, "appid": appid} if use_fastgpt else None
-        result = parser.parse(tmp_path, use_fastgpt=use_fastgpt, fastgpt_config=fastgpt_cfg)
-        fields_list = _field_result(result["extracted_fields"], result["ocr_results"])
-        return {
-            "success":   True,
-            "fields":    fields_list,
-            "ocr_count": len(result["ocr_results"]),
-            "timestamp": result["timestamp"],
-        }
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        _cleanup(tmp_path)
-
-
-@app.post("/api/ocr/quotation")
-async def ocr_quotation(
-    file: UploadFile = File(...),
-    use_fastgpt: bool = Form(False),
-    api_url:  str = Form(""),
-    api_key:  str = Form(""),
-    appid:    str = Form(""),
-):
-    """
-    报价单 OCR 识别。
-    返回：{ success, fields: [{key,field,value,confidence}], ocr_count, timestamp }
-    """
-    tmp_path = _save_upload(file)
-    try:
-        from ocr_core import QuotationParser
-        parser = QuotationParser()
-        fastgpt_cfg = {"api_url": api_url, "api_key": api_key, "appid": appid} if use_fastgpt else None
-        result = parser.parse(tmp_path, use_fastgpt=use_fastgpt, fastgpt_config=fastgpt_cfg)
-        fields_list = _field_result(result["extracted_fields"], result["ocr_results"])
-        return {
-            "success":   True,
-            "fields":    fields_list,
-            "ocr_count": len(result["ocr_results"]),
-            "timestamp": result["timestamp"],
-        }
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        _cleanup(tmp_path)
 
 
 @app.post("/api/ocr/table-structure")
@@ -635,9 +614,10 @@ async def ocr_table_structure(
     返回：{ success, table_html, cells, num_rows, num_cols, ocr_count, timestamp }
     """
     tmp_path = _save_upload(file)
+    session_dir = _create_session_dir()
     try:
         from ocr_core import run_pp_structure
-        result = run_pp_structure(tmp_path)
+        result = run_pp_structure(tmp_path, output_dir=session_dir)
         return {
             "success":    True,
             "table_html": result.get("html", ""),
@@ -645,70 +625,6 @@ async def ocr_table_structure(
             "num_rows":   result.get("num_rows", 0),
             "num_cols":   result.get("num_cols", 0),
             "ocr_count":  result.get("ocr_count", 0),
-            "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        _cleanup(tmp_path)
-
-
-@app.post("/api/ocr/table-advanced")
-async def ocr_table_advanced(
-    file: UploadFile = File(...),
-    export_format: str = Form("none"),  # "none" | "excel" | "csv" | "markdown" | "all"
-):
-    """
-    三阶段表格识别接口（线检测 → TSR → 单元格重建）。
-
-    - Stage 1：HoughLinesP 检测横纵线
-    - Stage 2：交点矩阵构建逻辑单元格坐标
-    - Stage 3：逐单元格 ROI 送入 OCR，语义对齐归并
-
-    export_format 参数控制是否同时导出文件：
-      none     - 仅返回 JSON
-      excel    - 额外导出 .xlsx
-      csv      - 额外导出 .csv
-      markdown - 额外导出 .md
-      all      - 导出三种格式
-
-    返回：{ success, table_html, cells, grid, num_rows, num_cols,
-             source, debug, exports, timestamp }
-    """
-    tmp_path = _save_upload(file)
-    try:
-        from ocr_core import TableDetector, TableExporter
-        result = TableDetector.process(tmp_path)
-
-        exports: dict = {}
-        grid = result.get("grid", [])
-        if export_format != "none" and grid:
-            import tempfile, os as _os
-            base = tempfile.mktemp(prefix="table_export_")
-            if export_format == "all":
-                exports = TableExporter.export_all(grid, base)
-            elif export_format == "excel":
-                exports["excel"] = TableExporter.to_excel(grid, base + ".xlsx")
-            elif export_format == "csv":
-                exports["csv"] = TableExporter.to_csv(grid, base + ".csv")
-            elif export_format == "markdown":
-                exports["markdown"] = TableExporter.to_markdown(grid, base + ".md")
-            elif export_format == "html":
-                exports["html"] = TableExporter.to_html(grid, base + ".html")
-            elif export_format == "json":
-                exports["json"] = TableExporter.to_json(grid, base + ".json")
-
-        return {
-            "success":    True,
-            "table_html": result.get("html", ""),
-            "cells":      result.get("cells", []),
-            "grid":       grid,
-            "num_rows":   result.get("num_rows", 0),
-            "num_cols":   result.get("num_cols", 0),
-            "source":     result.get("source", ""),
-            "debug":      result.get("debug", {}),
-            "exports":    exports,
             "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     except Exception as e:

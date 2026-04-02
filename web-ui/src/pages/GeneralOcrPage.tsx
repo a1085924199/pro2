@@ -13,19 +13,32 @@ import {
 import { motion, AnimatePresence } from 'framer-motion'
 import UploadZone from '../components/UploadZone'
 import ResultTable from '../components/ResultTable'
-import { ocrGeneral, type FieldResult, downloadExportFile } from '../api'
+import { ocrGeneral, ocrExportFormat, type FieldResult, downloadExportFile } from '../api'
 
 interface PanelState {
-  files:     File[]
-  status:    'idle' | 'processing' | 'done' | 'error'
-  results:   FieldResult[]
-  rawText:   string
-  tableHtml: string
-  exports:   Record<string, string> | undefined
+  files:       File[]
+  status:      'idle' | 'processing' | 'done' | 'error'
+  results:     FieldResult[]
+  rawText:     string
+  tableHtml:   string
+  exports:     Record<string, string> | undefined
+  cachedCells: Array<{row: number; col: number; text: string; confidence: number}>
+  cachedRows:  number
+  cachedCols:  number
 }
 
 function initPanel(): PanelState {
-  return { files: [], status: 'idle', results: [], rawText: '', tableHtml: '', exports: undefined }
+  return {
+    files: [],
+    status: 'idle',
+    results: [],
+    rawText: '',
+    tableHtml: '',
+    exports: undefined,
+    cachedCells: [],
+    cachedRows: 0,
+    cachedCols: 0,
+  }
 }
 
 // 表格 HTML 渲染组件
@@ -101,11 +114,14 @@ export default function GeneralOcrPage() {
     try {
       const resp = await ocrGeneral(state.files[0], isDoc ? 'doc' : 'table', exportFormat)
       setState({
-        status:    'done',
-        results:   resp.fields,
-        rawText:   resp.raw_text ?? `已识别 ${resp.ocr_count} 个文本块`,
-        tableHtml: resp.table_html ?? '',
-        exports:   resp.exports,
+        status:      'done',
+        results:     resp.fields,
+        rawText:     resp.raw_text ?? `已识别 ${resp.ocr_count} 个文本块`,
+        tableHtml:   resp.table_html ?? '',
+        exports:     resp.exports,
+        cachedCells: resp.cells ?? [],
+        cachedRows:  resp.num_rows ?? 0,
+        cachedCols:  resp.num_cols ?? 0,
       })
       messageApi.success('识别完成')
     } catch (e: unknown) {
@@ -115,14 +131,24 @@ export default function GeneralOcrPage() {
     }
   }
 
-  // 导出单个格式（触发识别 + 导出）
+  // 导出单个格式（已有缓存则直接导出，无缓存则走识别路径）
   const handleExport = async (fmt: 'excel' | 'csv' | 'markdown' | 'html' | 'json') => {
     if (state.files.length === 0) { messageApi.warning('请先上传图片文件'); return }
     setState({ status: 'processing' })
     try {
-      const resp = await ocrGeneral(state.files[0], isDoc ? 'doc' : 'table', fmt)
-      // 下载返回的文件
-      const filePath = resp.exports?.[fmt]
+      let filePath: string | undefined
+      let resp: Awaited<ReturnType<typeof ocrGeneral>> | null = null
+
+      if (state.cachedCells.length > 0 && state.cachedRows > 0 && state.cachedCols > 0) {
+        // 已有识别结果 → 调用专用导出接口，不重跑 OCR
+        const exportResp = await ocrExportFormat(state.cachedCells, state.cachedRows, state.cachedCols, fmt)
+        filePath = exportResp.exports?.[fmt]
+      } else {
+        // 无缓存 → 降级走旧的完整识别路径
+        resp = await ocrGeneral(state.files[0], isDoc ? 'doc' : 'table', fmt)
+        filePath = resp.exports?.[fmt]
+      }
+
       if (filePath) {
         const filename = filePath.split(/[\\/]/).pop() || `${fmt}_export`
         downloadExportFile(filename)
@@ -130,17 +156,61 @@ export default function GeneralOcrPage() {
       } else {
         messageApi.warning(`未能获取 ${fmt.toUpperCase()} 文件路径`)
       }
-      setState({
-        status:    'done',
-        results:   resp.fields,
-        rawText:   resp.raw_text ?? '',
-        tableHtml: resp.table_html ?? '',
-        exports:   resp.exports,
-      })
+
+      // 如果走了识别路径，同步更新缓存
+      if (resp) {
+        const patch: Partial<PanelState> = {
+          status:      'done',
+          results:     resp.fields,
+          rawText:     resp.raw_text ?? '',
+          tableHtml:   resp.table_html ?? '',
+          exports:     resp.exports,
+          cachedCells: resp.cells ?? [],
+          cachedRows:  resp.num_rows ?? 0,
+          cachedCols:  resp.num_cols ?? 0,
+        }
+        setState(patch)
+      } else {
+        setState({ status: 'done' })
+      }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
       setState({ status: 'error', rawText: msg })
       messageApi.error(`导出失败：${msg}`)
+    }
+  }
+
+  // 导出全部格式（已有缓存则直接导出，无缓存则先识别）
+  const handleExportAll = async () => {
+    if (state.files.length === 0) { messageApi.warning('请先上传图片文件'); return }
+    setState({ status: 'processing' })
+    try {
+      if (state.cachedCells.length > 0 && state.cachedRows > 0 && state.cachedCols > 0) {
+        // 有缓存 → 调用导出接口
+        const exportResp = await ocrExportFormat(state.cachedCells, state.cachedRows, state.cachedCols, 'all')
+        const exports = exportResp.exports ?? {}
+        if (Object.keys(exports).length > 0) {
+          // 依次触发下载
+          for (const [, filePath] of Object.entries(exports)) {
+            const filename = filePath.split(/[\\/]/).pop() || 'export'
+            downloadExportFile(filename)
+            await new Promise((r) => setTimeout(r, 300))
+          }
+          messageApi.success('已导出全部格式文件')
+        } else {
+          messageApi.warning('未能获取导出文件路径')
+        }
+      } else {
+        // 无缓存 → 走完整识别 + 导出路径
+        await handleProcess('all')
+        return
+      }
+      setState({ status: 'done' })
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      // 导出失败时降级到完整识别路径
+      messageApi.warning(`专用导出失败，改为识别后导出：${msg}`)
+      await handleProcess('all')
     }
   }
 
@@ -207,7 +277,7 @@ export default function GeneralOcrPage() {
             <div style={{ height: 2, background: `linear-gradient(90deg, ${color}, transparent)`, borderRadius: 2, marginBottom: 24 }} />
 
             <UploadZone
-              onFiles={(files) => setState({ files, status: 'idle', results: [], tableHtml: '', exports: undefined })}
+              onFiles={(files) => setState({ files, status: 'idle', results: [], tableHtml: '', exports: undefined, cachedCells: [], cachedRows: 0, cachedCols: 0 })}
               multiple={false}
               label={isDoc ? '拖拽文档图片至此，或点击选择' : '拖拽表格图片至此，或点击选择'}
               hint={isDoc ? '支持扫描件、拍照件等各类文档图片' : '支持印刷表格、手写表格、复杂嵌套表格'}
@@ -265,7 +335,7 @@ export default function GeneralOcrPage() {
                           key: 'all',
                           icon: <DownloadOutlined />,
                           label: '导出全部格式',
-                          onClick: () => handleProcess('all'),
+                          onClick: () => handleExportAll(),
                         },
                       ],
                     }}

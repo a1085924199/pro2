@@ -12,9 +12,6 @@ ocr_core.py - OCR 核心处理模块 v7.0
   RepairOrderParser      - 调修单专用解析器
   RepairCardParser       - 返修卡专用解析器
   MaterialParser         - 航材出入库单专用解析器
-  InspectionReportParser - 检验报告单专用解析器
-  MaintenanceRecordParser- 维修记录单专用解析器
-  QuotationParser        - 报价单专用解析器
 """
 import os
 import json
@@ -43,9 +40,6 @@ class OCRTask(str, Enum):
     REPAIR_ORDER = 'repair_order'  # 调修单
     REPAIR_CARD  = 'repair_card'   # 返修卡
     MATERIAL     = 'material'      # 航材出入库单
-    INSPECTION   = 'inspection'    # 检验报告单
-    MAINTENANCE  = 'maintenance'   # 维修记录单
-    QUOTATION    = 'quotation'     # 报价单
     GENERAL      = 'general'       # 通用识别
 
 # ============================================================================
@@ -271,92 +265,51 @@ def _extract_texts_from_results(results: list) -> List[Dict]:
     return ocr_results
 
 
-def _parse_v3_result(pp_result: list, img_shape: tuple) -> Dict:
+def _parse_v3_result(pp_result: list, img_shape: tuple, xlsx_path: str = "") -> Dict:
     """
-    简化版解析函数：从 PPStructureV3.predict() 结果中提取所需数据。
-    表格数据直接使用 Result 对象的内置方法保存，HTML单元格解析已简化。
+    从 PPStructureV3.predict() 结果中提取所需数据。
+    优先从 pp_result 的 HTML 属性解析（内存中，无文件锁定问题），
+    Excel 文件路径仅作参考，不依赖读取。
     """
     ocr_results: List[Dict] = _extract_texts_from_results(pp_result)
-    
-    # 提取表格区域信息
+
+    # 优先从 pp_result 的 html 属性解析（最可靠，无文件句柄冲突）
+    for result in pp_result:
+        html = getattr(result, 'html', None)
+        if html:
+            table_data = _parse_table_from_html(html if isinstance(html, str) else str(html))
+            if table_data:
+                return {
+                    'ocr_results': ocr_results,
+                    'table_regions': [{
+                        'bbox': list(getattr(result, 'bbox', [])) if hasattr(result, 'bbox') else [],
+                        'html': table_data['html'],
+                        'cells': table_data['cells'],
+                        'num_rows': table_data['num_rows'],
+                        'num_cols': table_data['num_cols'],
+                    }],
+                    'layout_regions': [],
+                }
+
+    # 降级：尝试从 HTML 解析（结果对象中取不到时）
     table_regions: List[Dict] = []
     for result in pp_result:
         html = getattr(result, 'html', None)
         if html:
-            # 尝试获取表格的 bbox
             bbox = getattr(result, 'bbox', [])
             table_regions.append({
                 'bbox': list(bbox) if bbox else [],
                 'html': html if isinstance(html, str) else str(html),
-                'cells': _parse_html_cells(html) if isinstance(html, str) else [],
+                'cells': [],
+                'num_rows': 0,
+                'num_cols': 0,
             })
-    
+
     return {
         'ocr_results': ocr_results,
         'table_regions': table_regions,
-        'layout_regions': [],  # 已简化，不再需要详细版面区域
+        'layout_regions': [],
     }
-
-
-def _parse_html_cells(html: str) -> List[Dict]:
-    """
-    从 HTML 表格字符串中提取单元格信息。
-    返回 [{row, col, row_span, col_span, text}] 列表。
-    """
-    if not html:
-        return []
-    
-    cells: List[Dict] = []
-    
-    # 去掉 thead/tbody 标签
-    html_clean = re.sub(r'</?(?:thead|tbody)[^>]*>', '', html, flags=re.IGNORECASE)
-    
-    # 查找所有<tr>标签
-    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html_clean, re.IGNORECASE | re.DOTALL)
-    
-    if not rows:
-        # 没有 <tr> 标签时，直接提取所有 <td> 标签内容
-        td_iter = re.finditer(r'<td([^>]*)>(.*?)</td>', html_clean, re.IGNORECASE | re.DOTALL)
-        td_list = list(td_iter)
-        
-        if td_list:
-            # 估算列数，最多5列
-            estimated_cols = min(len(td_list), 5)
-            for i, td in enumerate(td_list):
-                attrs, content = td.group(1), td.group(2)
-                cs_m = re.search(r'colspan=["\']?(\d+)', attrs, re.IGNORECASE)
-                rs_m = re.search(r'rowspan=["\']?(\d+)', attrs, re.IGNORECASE)
-                
-                cells.append({
-                    'row': i // estimated_cols,
-                    'col': i % estimated_cols,
-                    'row_span': int(rs_m.group(1)) if rs_m else 1,
-                    'col_span': int(cs_m.group(1)) if cs_m else 1,
-                    'text': re.sub(r'<[^>]+>', '', content).strip(),
-                    'confidence': 1.0,
-                })
-        return cells
-    
-    # 正常处理 <tr> 标签
-    for r_idx, row_html in enumerate(rows):
-        td_iter = re.finditer(r'<td([^>]*)>(.*?)</td>', row_html, re.IGNORECASE | re.DOTALL)
-        c_idx = 0
-        for td in td_iter:
-            attrs, content = td.group(1), td.group(2)
-            cs_m = re.search(r'colspan=["\']?(\d+)', attrs, re.IGNORECASE)
-            rs_m = re.search(r'rowspan=["\']?(\d+)', attrs, re.IGNORECASE)
-            
-            cells.append({
-                'row': r_idx,
-                'col': c_idx,
-                'row_span': int(rs_m.group(1)) if rs_m else 1,
-                'col_span': int(cs_m.group(1)) if cs_m else 1,
-                'text': re.sub(r'<[^>]+>', '', content).strip(),
-                'confidence': 1.0,
-            })
-            c_idx += int(cs_m.group(1)) if cs_m else 1
-    
-    return cells
 
 
 def build_table_structure(text_boxes: List[Dict]) -> Optional[Dict]:
@@ -449,7 +402,7 @@ def build_table_structure(text_boxes: List[Dict]) -> Optional[Dict]:
 class DocParser:
     FIELDS: List[str] = []
 
-    def parse(self, image_path: str, use_fastgpt=False, fastgpt_config=None) -> Dict:
+    def parse(self, image_path: str, use_fastgpt=False, fastgpt_config=None, output_dir: str = None) -> Dict:
         """
         统一解析入口：
         1. PPStructureV3 完整处理（版面分析 + OCR + 表格）
@@ -460,9 +413,10 @@ class DocParser:
         if img_bgr is None:
             raise ValueError(f'无法读取图像: {image_path}')
 
-        output_dir = 'output'
+        output_dir = output_dir or 'output'
         os.makedirs(output_dir, exist_ok=True)
         base_name = os.path.basename(image_path).split('.')[0]
+        xlsx_path = os.path.join(output_dir, f"{base_name}_table.xlsx")
 
         # PPStructureV3 处理
         try:
@@ -474,9 +428,9 @@ class DocParser:
             # 使用 Result 对象的方法保存表格数据
             for res in results:
                 res.save_to_html(save_path=os.path.join(output_dir, f"{base_name}_table.html"))
-                res.save_to_xlsx(save_path=os.path.join(output_dir, f"{base_name}_table.xlsx"))
+                res.save_to_xlsx(save_path=xlsx_path)
             
-            parsed = _parse_v3_result(results, img_bgr.shape[:2])
+            parsed = _parse_v3_result(results, img_bgr.shape[:2], xlsx_path=xlsx_path)
             ocr_results = parsed['ocr_results']
             table_regions = parsed['table_regions']
         except Exception as e:
@@ -664,226 +618,6 @@ class MaterialParser(DocParser):
         return fields
 
 
-# ── 检验报告单解析器 ──────────────────────────────────────────────────────────
-class InspectionReportParser(DocParser):
-    FIELDS = ['报告编号', '被检件名称', '被检件型号', '被检件编号',
-              '检验日期', '检验结论', '检验员', '备注']
-
-    def extract_fields(self, ocr_results):
-        fields = {f: '' for f in self.FIELDS}
-        texts  = sorted(ocr_results, key=lambda t: t['bbox'][1] if len(t.get('bbox', [])) == 4 else 0)
-        F = self._find_nearest
-        for item in texts:
-            t = item['text']
-            # 报告编号
-            if not fields['报告编号']:
-                if any(k in t for k in ['报告编号', '报告号', '检验编号']):
-                    nb = F(item, texts)
-                    if nb: fields['报告编号'] = nb['text']
-                elif re.match(r'^[A-Z]{1,4}[-\d]{4,}$', t.strip()): fields['报告编号'] = t
-            # 被检件名称
-            if not fields['被检件名称']:
-                if any(k in t for k in ['被检件名称', '器件名称', '零件名称', '名称']):
-                    nb = F(item, texts)
-                    if nb: fields['被检件名称'] = nb['text']
-                elif any(k in t for k in ['组件', '部件', '模块', '单元', '电源']) and len(t) > 2:
-                    fields['被检件名称'] = t
-            # 被检件型号
-            if not fields['被检件型号']:
-                if any(k in t for k in ['被检件型号', '零件型号', '型号']):
-                    nb = F(item, texts)
-                    if nb: fields['被检件型号'] = nb['text']
-                elif re.search(r'\d{3}[A-Za-z]?型|[A-Z]{2,}\d{3,}', t): fields['被检件型号'] = t
-            # 被检件编号
-            if not fields['被检件编号']:
-                if any(k in t for k in ['被检件编号', '零件编号', '件号', '序列号']):
-                    nb = F(item, texts)
-                    if nb: fields['被检件编号'] = nb['text']
-                elif re.match(r'^[A-Z0-9]{5,}$', t.strip()): fields['被检件编号'] = t
-            # 检验日期
-            if not fields['检验日期']:
-                if any(k in t for k in ['检验日期', '检验时间', '日期']):
-                    nb = F(item, texts)
-                    if nb and any(k in nb['text'] for k in ['年', '月', '日', '-', '/']):
-                        fields['检验日期'] = nb['text']
-                elif re.search(r'\d{4}[年\-/]\d{1,2}[月\-/]\d{1,2}', t): fields['检验日期'] = t
-            # 检验结论
-            if not fields['检验结论']:
-                if any(k in t for k in ['检验结论', '结论', '鉴定意见']):
-                    nb = F(item, texts)
-                    if nb: fields['检验结论'] = nb['text']
-                elif any(k in t for k in ['合格', '不合格', '报废', '修复', '返工']): fields['检验结论'] = t
-            # 检验员
-            if not fields['检验员']:
-                if any(k in t for k in ['检验员', '检验人', '检验人员']):
-                    nb = F(item, texts)
-                    if nb: fields['检验员'] = nb['text']
-            # 备注
-            if not fields['备注']:
-                if any(k in t for k in ['备注', '说明', '附注']):
-                    val = t
-                    for kw in ['备注', '说明', '附注']:
-                        val = val.replace(kw, '')
-                    val = val.replace('：', '').replace(':', '').strip()
-                    if val: fields['备注'] = val
-                    else:
-                        nb = F(item, texts)
-                        if nb: fields['备注'] = nb['text']
-        return fields
-
-
-# ── 维修记录单解析器 ──────────────────────────────────────────────────────────
-class MaintenanceRecordParser(DocParser):
-    FIELDS = ['记录编号', '器材名称', '器材型号', '故障现象', '维修措施',
-              '维修人员', '维修日期', '验收结果', '备注']
-
-    def extract_fields(self, ocr_results):
-        fields = {f: '' for f in self.FIELDS}
-        texts  = sorted(ocr_results, key=lambda t: t['bbox'][1] if len(t.get('bbox', [])) == 4 else 0)
-        F = self._find_nearest
-        for item in texts:
-            t = item['text']
-            # 记录编号
-            if not fields['记录编号']:
-                if any(k in t for k in ['记录编号', '维修编号', '工单号', '工单编号']):
-                    nb = F(item, texts)
-                    if nb: fields['记录编号'] = nb['text']
-                elif re.match(r'^[A-Z]{1,3}\d{5,}$', t.strip()): fields['记录编号'] = t
-            # 器材名称
-            if not fields['器材名称']:
-                if any(k in t for k in ['器材名称', '设备名称', '名称']):
-                    nb = F(item, texts)
-                    if nb: fields['器材名称'] = nb['text']
-            # 器材型号
-            if not fields['器材型号']:
-                if any(k in t for k in ['器材型号', '设备型号', '型号']):
-                    nb = F(item, texts)
-                    if nb: fields['器材型号'] = nb['text']
-                elif re.search(r'\d{3}[A-Za-z]?型|[A-Z]{2,}\d{2,}', t): fields['器材型号'] = t
-            # 故障现象
-            if not fields['故障现象']:
-                if any(k in t for k in ['故障现象', '故障描述', '故障情况']):
-                    val = t
-                    for kw in ['故障现象', '故障描述', '故障情况']:
-                        val = val.replace(kw, '')
-                    val = val.replace('：', '').replace(':', '').strip()
-                    fields['故障现象'] = val if val else (F(item, texts) or {}).get('text', '')
-            # 维修措施
-            if not fields['维修措施']:
-                if any(k in t for k in ['维修措施', '处理措施', '维修方案', '处理方法']):
-                    val = t
-                    for kw in ['维修措施', '处理措施', '维修方案', '处理方法']:
-                        val = val.replace(kw, '')
-                    val = val.replace('：', '').replace(':', '').strip()
-                    fields['维修措施'] = val if val else (F(item, texts) or {}).get('text', '')
-            # 维修人员
-            if not fields['维修人员']:
-                if any(k in t for k in ['维修人员', '维修人', '承修人']):
-                    nb = F(item, texts)
-                    if nb: fields['维修人员'] = nb['text']
-            # 维修日期
-            if not fields['维修日期']:
-                if any(k in t for k in ['维修日期', '维修时间', '日期']):
-                    nb = F(item, texts)
-                    if nb and any(k in nb['text'] for k in ['年', '月', '日', '-', '/']):
-                        fields['维修日期'] = nb['text']
-                elif re.search(r'\d{4}[年\-/]\d{1,2}[月\-/]\d{1,2}', t): fields['维修日期'] = t
-            # 验收结果
-            if not fields['验收结果']:
-                if any(k in t for k in ['验收结果', '验收结论', '检验结果']):
-                    nb = F(item, texts)
-                    if nb: fields['验收结果'] = nb['text']
-                elif any(k in t for k in ['合格', '不合格', '通过', '不通过']): fields['验收结果'] = t
-            # 备注
-            if not fields['备注']:
-                if any(k in t for k in ['备注', '说明', '附注']):
-                    val = t
-                    for kw in ['备注', '说明', '附注']:
-                        val = val.replace(kw, '')
-                    val = val.replace('：', '').replace(':', '').strip()
-                    if val: fields['备注'] = val
-                    else:
-                        nb = F(item, texts)
-                        if nb: fields['备注'] = nb['text']
-        return fields
-
-
-# ── 报价单解析器 ──────────────────────────────────────────────────────────────
-class QuotationParser(DocParser):
-    FIELDS = ['报价单号', '客户名称', '产品名称', '型号规格', '数量',
-              '单价', '总价', '报价日期', '有效期', '联系人', '联系电话']
-
-    def extract_fields(self, ocr_results):
-        fields = {f: '' for f in self.FIELDS}
-        texts  = sorted(ocr_results, key=lambda t: t['bbox'][1] if len(t.get('bbox', [])) == 4 else 0)
-        F = self._find_nearest
-        for item in texts:
-            t = item['text']
-            # 报价单号
-            if not fields['报价单号']:
-                if any(k in t for k in ['报价单号', '报价单', '单号']):
-                    nb = F(item, texts)
-                    if nb: fields['报价单号'] = nb['text']
-                elif re.match(r'^[A-Z]{1,3}\d{5,}$', t.strip()): fields['报价单号'] = t
-            # 客户名称
-            if not fields['客户名称']:
-                if any(k in t for k in ['客户名称', '客户', '单位名称']):       
-                    nb = F(item, texts)
-                    if nb: fields['客户名称'] = nb['text']
-            # 产品名称
-            if not fields['产品名称']:
-                if any(k in t for k in ['产品名称', '产品', '名称']):
-                    nb = F(item, texts)
-                    if nb: fields['产品名称'] = nb['text']
-            # 型号规格
-            if not fields['型号规格']:
-                if any(k in t for k in ['型号规格', '型号', '规格']):
-                    nb = F(item, texts)
-                    if nb: fields['型号规格'] = nb['text']
-            # 数量
-            if not fields['数量']:
-                if any(k in t for k in ['数量', '数量：', '数量:']):
-                    nb = F(item, texts)
-                    if nb: fields['数量'] = nb['text']
-                elif re.match(r'^\d+(\.\d+)?$', t.strip()): fields['数量'] = t  
-            # 单价
-            if not fields['单价']:
-                if any(k in t for k in ['单价', '单价：', '单价:']):
-                    nb = F(item, texts)
-                    if nb: fields['单价'] = nb['text']
-                elif re.match(r'^¥?\d+(\.\d+)?$', t.strip()): fields['单价'] = t
-            # 总价
-            if not fields['总价']:
-                if any(k in t for k in ['总价', '合计', '总计']):
-                    nb = F(item, texts)
-                    if nb: fields['总价'] = nb['text']
-                elif re.match(r'^¥?\d+(\.\d+)?$', t.strip()): fields['总价'] = t
-            # 报价日期
-            if not fields['报价日期']:
-                if any(k in t for k in ['报价日期', '日期']):
-                    nb = F(item, texts)
-                    if nb and any(k in nb['text'] for k in ['年', '月', '日', '-', '/']):
-                        fields['报价日期'] = nb['text']
-                elif re.search(r'\d{4}[年\-/]\d{1,2}[月\-/]\d{1,2}', t): fields['报价日期'] = t
-            # 有效期
-            if not fields['有效期']:
-                if any(k in t for k in ['有效期', '有效期限']):
-                    nb = F(item, texts)
-                    if nb: fields['有效期'] = nb['text']
-            # 联系人
-            if not fields['联系人']:
-                if any(k in t for k in ['联系人', '联系人：', '联系人:']):      
-                    nb = F(item, texts)
-                    if nb: fields['联系人'] = nb['text']
-            # 联系电话
-            if not fields['联系电话']:
-                if any(k in t for k in ['联系电话', '电话', '手机号']):
-                    nb = F(item, texts)
-                    if nb: fields['联系电话'] = nb['text']
-                elif re.match(r'^1[3-9]\d{9}$', t.strip()): fields['联系电话'] = t
-        return fields
-
-
 # ============================================================================
 # 统一 OCR 流水线
 # ============================================================================
@@ -931,7 +665,7 @@ class OCRPipeline:
             res.save_to_xlsx(save_path=xlsx_path)
 
         # 解析结果获取文本和表格数据
-        parsed = _parse_v3_result(results, img_bgr.shape[:2])
+        parsed = _parse_v3_result(results, img_bgr.shape[:2], xlsx_path=xlsx_path)
         ocr_results = parsed['ocr_results']
         table_regions = parsed['table_regions']
 
@@ -957,6 +691,21 @@ class OCRPipeline:
             # 如果没有检测到表格区域，使用备用方案
             table = build_table_structure(ocr_results)
 
+        # 当 ocr_results 为空但 table_regions 有 cells 时，从 cells 重建 ocr_results
+        # 这样字段解析器（RepairOrderParser 等）仍能正常工作
+        if not ocr_results and table.get('cells'):
+            cells = table['cells']
+            # 估算 bbox（根据行列位置估算相对坐标，避免为空）
+            for cell in cells:
+                if cell.get('text', '').strip():
+                    ocr_results.append({
+                        'text': cell['text'],
+                        'confidence': cell.get('confidence', 1.0),
+                        'bbox': [cell['col'] * 100, cell['row'] * 30, (cell['col'] + 1) * 100, (cell['row'] + 1) * 30],
+                        'poly': [],
+                        'type': 'table_cell',
+                    })
+
         # 根据任务类型选择解析器并提取字段
         extracted_fields = {}
         if task_type != OCRTask.GENERAL:
@@ -964,9 +713,6 @@ class OCRPipeline:
                 OCRTask.REPAIR_ORDER: RepairOrderParser(),
                 OCRTask.REPAIR_CARD: RepairCardParser(),
                 OCRTask.MATERIAL: MaterialParser(kwargs.get('doc_type', 'out')),
-                OCRTask.INSPECTION: InspectionReportParser(),
-                OCRTask.MAINTENANCE: MaintenanceRecordParser(),
-                OCRTask.QUOTATION: QuotationParser(),
             }
             parser = parser_map.get(task_type, DocParser())
 
@@ -1012,9 +758,6 @@ class OCRPipeline:
             'repair_order': OCRTask.REPAIR_ORDER,
             'repair_card': OCRTask.REPAIR_CARD,
             'material': OCRTask.MATERIAL,
-            'inspection': OCRTask.INSPECTION,
-            'maintenance': OCRTask.MAINTENANCE,
-            'quotation': OCRTask.QUOTATION,
             'general': OCRTask.GENERAL
         }
         task_type = task_map.get(task, OCRTask.GENERAL)
@@ -1031,7 +774,7 @@ class RepairOrderOCR:
     def __init__(self):
         pass
 
-    def process_image(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None) -> Dict:
+    def process_image(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None) -> Dict:
         """
         处理调修单图像
         """
@@ -1040,32 +783,169 @@ class RepairOrderOCR:
             task_type=OCRTask.REPAIR_ORDER,
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_config,
-            output_dir='output'
+            output_dir=output_dir or 'output'
         )
 
-    def ocr_recognize(self, image_path: str) -> List[Dict]:
+    def ocr_recognize(self, image_path: str, output_dir: str = None) -> List[Dict]:
         """
         纯OCR识别
         """
         result = OCRPipeline.process(
             image_path,
             task_type=OCRTask.TEXT,
-            output_dir='output'
+            output_dir=output_dir or 'output'
         )
         return result['ocr_results']
 
 
 # ============================================================================
+# 表格解析工具：从 PPStructureV3 生成的 Excel 读取结构化表格
+# ============================================================================
+def _parse_table_from_html(html: str) -> Optional[Dict]:
+    """
+    从 PPStructureV3 的 HTML 表格中解析单元格结构。
+    正确处理 rowspan/colspan 合并单元格，返回展开后的行列网格。
+    """
+    if not html:
+        return None
+    try:
+        from html.parser import HTMLParser
+
+        class TableParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.grid: List[List[str]] = []
+                self.current_row: List[str] = []
+                self.current_cell_text: str = ""
+                self.in_cell: bool = False
+
+            def handle_starttag(self, tag, attrs):
+                attrs_dict = dict(attrs)
+                if tag == "tr":
+                    self.current_row = []
+                elif tag in ("td", "th"):
+                    self.in_cell = True
+                    self.current_cell_text = ""
+
+            def handle_endtag(self, tag):
+                if tag in ("td", "th") and self.in_cell:
+                    self.in_cell = False
+                    text = self.current_cell_text.strip()
+                    self.current_row.append(text)
+                elif tag == "tr":
+                    if self.current_row:
+                        self.grid.append(self.current_row)
+
+            def handle_data(self, data):
+                if self.in_cell:
+                    self.current_cell_text += data
+
+        parser = TableParser()
+        parser.feed(html)
+        grid = parser.grid
+
+        if not grid:
+            return None
+
+        num_rows = len(grid)
+        num_cols = max((len(row) for row in grid), default=0)
+
+        # 构建 cells 列表
+        cells = []
+        for r in range(num_rows):
+            for c in range(len(grid[r])):
+                cells.append({
+                    'row': r,
+                    'col': c,
+                    'row_span': 1,
+                    'col_span': 1,
+                    'text': grid[r][c],
+                    'confidence': 1.0,
+                })
+
+        # 重建标准 HTML（去掉非标准格式）
+        rows_html = []
+        for row in grid:
+            rows_html.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
+        std_html = "<table>" + "".join(rows_html) + "</table>"
+
+        return {
+            'html': std_html,
+            'cells': cells,
+            'num_rows': num_rows,
+            'num_cols': num_cols,
+        }
+    except Exception as e:
+        print(f"[_parse_table_from_html] 解析失败: {e}")
+        return None
+
+
+def _read_table_from_excel(xlsx_path: str) -> Optional[Dict]:
+    """
+    读取 PPStructureV3 保存的 Excel 文件，返回标准表格结构。
+    这是最可靠的表格数据来源，比解析 HTML 或从文本框反推更准确。
+
+    返回:
+        {
+            'html': str,           # 重建的 HTML 表格
+            'cells': [{row, col, row_span, col_span, text, confidence}],
+            'num_rows': int,
+            'num_cols': int,
+        }
+        若文件不存在或读取失败，返回 None。
+    """
+    if not os.path.exists(xlsx_path):
+        return None
+    try:
+        import pandas as pd
+        df = pd.read_excel(xlsx_path, header=None, dtype=str).fillna("")
+        grid = df.values.tolist()
+        num_rows = len(grid)
+        num_cols = len(grid[0]) if grid else 0
+
+        if num_rows == 0 or num_cols == 0:
+            return None
+
+        cells = []
+        for r in range(num_rows):
+            for c in range(num_cols):
+                cells.append({
+                    'row': r,
+                    'col': c,
+                    'row_span': 1,
+                    'col_span': 1,
+                    'text': str(grid[r][c]),
+                    'confidence': 1.0,
+                })
+
+        rows_html = []
+        for r in range(num_rows):
+            tds = "".join(f"<td>{grid[r][c]}</td>" for c in range(num_cols))
+            rows_html.append(f"<tr>{tds}</tr>")
+        html = "<table>" + "".join(rows_html) + "</table>"
+
+        return {
+            'html': html,
+            'cells': cells,
+            'num_rows': num_rows,
+            'num_cols': num_cols,
+        }
+    except Exception as e:
+        print(f"[_read_table_from_excel] 读取失败: {e}")
+        return None
+
+
+# ============================================================================
 # 兼容层：表格相关函数和类
 # ============================================================================
-def run_pp_structure(image_path: str) -> Dict:
+def run_pp_structure(image_path: str, output_dir: str = None) -> Dict:
     """
     兼容旧接口的表格识别函数
     """
     result = OCRPipeline.process(
         image_path,
         task_type=OCRTask.TABLE,
-        output_dir='output'
+        output_dir=output_dir or 'output'
     )
     table = result.get('table', {})
     return {
@@ -1078,42 +958,22 @@ def run_pp_structure(image_path: str) -> Dict:
 
 def _build_table_from_textboxes(text_boxes: List[Dict]) -> Dict:
     """
-    从文本框构建表格结构
+    从文本框构建表格结构（纯几何推断，仅作为最终 fallback）。
+    优先由 _read_table_from_excel 处理，本函数仅在无 Excel 时兜底使用。
     """
     return build_table_structure(text_boxes)
 
 
 class TableDetector:
     """
-    兼容旧接口的表格检测器
+    表格检测辅助工具，提供单元格到网格的转换。
     """
-    @staticmethod
-    def process(image_path: str) -> Dict:
-        """
-        处理表格图像
-        """
-        result = OCRPipeline.process(
-            image_path,
-            task_type=OCRTask.TABLE,
-            output_dir='output'
-        )
-        table = result.get('table', {})
-        return {
-            'html': table.get('html', ''),
-            'cells': table.get('cells', []),
-            'grid': [],  # 兼容字段
-            'num_rows': table.get('num_rows', 0),
-            'num_cols': table.get('num_cols', 0),
-            'source': 'PPStructureV3',
-            'debug': {}
-        }
-    
     @staticmethod
     def _cells_to_grid(cells: List[Dict], num_rows: int, num_cols: int) -> List[List[str]]:
         """
-        将单元格转换为网格
+        将单元格列表转换为二维网格数组。
         """
-        grid = [["" for _ in range(num_cols)] for _ in range(num_rows)]
+        grid = [[""] * num_cols for _ in range(num_rows)]
         for cell in cells:
             row = cell.get('row', 0)
             col = cell.get('col', 0)
