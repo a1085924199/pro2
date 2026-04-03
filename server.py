@@ -1607,71 +1607,25 @@ async def ocr_general(
 ):
     """
     通用 OCR 识别。
-    - doc 模式：返回全文文本行列表
-    - table 模式：尝试结构化表格，返回行列 cells，支持 export_format 导出
+    - doc 模式：使用纯 PaddleOCR 快速模式，返回全文文本行列表
+    - table 模式：使用 PPStructureV3，尝试结构化表格，支持 export_format 导出
     返回：{ success, fields, raw_text, table_html, ocr_count, exports, timestamp }
     """
     tmp_path = _save_upload(file)
-    # 创建独立会话目录，存放本次识别的所有文件
     session_dir = _create_session_dir()
     try:
         from ocr_core import OCRPipeline, OCRTask, TableDetector, TableExporter
 
-        # 统一流水线：一次调用获取 OCR 结果 + 表格结构
-        pipeline_result = OCRPipeline.process(
-            tmp_path,
-            task_type=OCRTask.TABLE if mode == "table" else OCRTask.GENERAL,
-            output_dir=session_dir,
-        )
-        ocr_results = pipeline_result.get("ocr_results", [])
-        table_data = pipeline_result.get("table", {})
+        if mode == "doc":
+            # 文档模式：使用纯 PaddleOCR 快速模式，只做文本检测+识别
+            pipeline_result = OCRPipeline.process(
+                tmp_path,
+                task_type=OCRTask.GENERAL,
+                output_dir=session_dir,
+                mode="fast",  # 强制使用快速模式
+            )
+            ocr_results = pipeline_result.get("ocr_results", [])
 
-        raw_text = " | ".join(item["text"] for item in ocr_results)
-        summary = f"已识别 {len(ocr_results)} 个文本块，共 {len(raw_text)} 字符。"
-
-        table_html = ""
-        exports: dict = {}
-        cells = table_data.get("cells", [])
-        num_rows = table_data.get("num_rows", 0)
-        num_cols = table_data.get("num_cols", 0)
-        if mode == "table" and cells:
-            table_html = table_data.get("html", "")
-
-            fields_list = [
-                {
-                    "key":        f"r{c['row']}c{c['col']}",
-                    "field":      f"第{c['row']+1}行 第{c['col']+1}列",
-                    "value":      c["text"],
-                    "confidence": c.get("confidence", 1.0),
-                }
-                for c in cells
-            ]
-
-            if cells and num_rows > 0 and num_cols > 0:
-                summary = f"已识别表格结构，共 {num_rows} 行 × {num_cols} 列，{len(cells)} 个单元格。"
-            elif ocr_results:
-                summary = f"已识别 {len(ocr_results)} 个文本块，但无法形成有效表格结构。"
-            else:
-                summary = "未检测到任何内容。"
-
-            # ── 多格式导出 ──────────────────────────────────────────────────
-            if export_format != "none" and cells:
-                grid = TableDetector._cells_to_grid(cells, num_rows, num_cols)
-                base = os.path.join(session_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-                if export_format == "all":
-                    exports = TableExporter.export_all(grid, base)
-                elif export_format == "excel":
-                    exports["excel"] = TableExporter.to_excel(grid, base + ".xlsx")
-                elif export_format == "csv":
-                    exports["csv"] = TableExporter.to_csv(grid, base + ".csv")
-                elif export_format == "markdown":
-                    exports["markdown"] = TableExporter.to_markdown(grid, base + ".md")
-                elif export_format == "html":
-                    exports["html"] = TableExporter.to_html(grid, base + ".html")
-                elif export_format == "json":
-                    exports["json"] = TableExporter.to_json(grid, base + ".json")
-        else:
-            # 文档模式：每行文本作为一个字段
             fields_list = [
                 {
                     "key":        str(i),
@@ -1682,18 +1636,86 @@ async def ocr_general(
                 for i, item in enumerate(ocr_results)
             ]
 
-        return {
-            "success":    True,
-            "fields":     fields_list,
-            "raw_text":   summary,
-            "table_html": table_html,
-            "ocr_count":  len(ocr_results),
-            "cells":      cells,
-            "num_rows":   num_rows,
-            "num_cols":   num_cols,
-            "exports":    exports,
-            "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+            raw_text = " | ".join(item["text"] for item in ocr_results)
+            summary = f"已识别 {len(ocr_results)} 个文本块，共 {len(raw_text)} 字符。"
+
+            return {
+                "success":    True,
+                "fields":     fields_list,
+                "raw_text":   summary,
+                "table_html": "",
+                "ocr_count":  len(ocr_results),
+                "cells":      [],
+                "num_rows":   0,
+                "num_cols":   0,
+                "exports":    {},
+                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        else:
+            # 表格模式：使用 PPStructureV3 完整流程
+            pipeline_result = OCRPipeline.process(
+                tmp_path,
+                task_type=OCRTask.TABLE,
+                output_dir=session_dir,
+            )
+            ocr_results = pipeline_result.get("ocr_results", [])
+            table_data = pipeline_result.get("table", {})
+
+            cells = table_data.get("cells", [])
+            num_rows = table_data.get("num_rows", 0)
+            num_cols = table_data.get("num_cols", 0)
+            table_html = ""
+            exports: dict = {}
+
+            if cells:
+                table_html = table_data.get("html", "")
+
+                fields_list = [
+                    {
+                        "key":        f"r{c['row']}c{c['col']}",
+                        "field":      f"第{c['row']+1}行 第{c['col']+1}列",
+                        "value":      c["text"],
+                        "confidence": c.get("confidence", 1.0),
+                    }
+                    for c in cells
+                ]
+
+                if num_rows > 0 and num_cols > 0:
+                    summary = f"已识别表格结构，共 {num_rows} 行 × {num_cols} 列，{len(cells)} 个单元格。"
+                else:
+                    summary = f"已识别 {len(ocr_results)} 个文本块，但无法形成有效表格结构。"
+
+                if export_format != "none" and cells:
+                    grid = TableDetector._cells_to_grid(cells, num_rows, num_cols)
+                    base = os.path.join(session_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                    if export_format == "all":
+                        exports = TableExporter.export_all(grid, base)
+                    elif export_format == "excel":
+                        exports["excel"] = TableExporter.to_excel(grid, base + ".xlsx")
+                    elif export_format == "csv":
+                        exports["csv"] = TableExporter.to_csv(grid, base + ".csv")
+                    elif export_format == "markdown":
+                        exports["markdown"] = TableExporter.to_markdown(grid, base + ".md")
+                    elif export_format == "html":
+                        exports["html"] = TableExporter.to_html(grid, base + ".html")
+                    elif export_format == "json":
+                        exports["json"] = TableExporter.to_json(grid, base + ".json")
+            else:
+                fields_list = []
+                summary = "未检测到任何内容。"
+
+            return {
+                "success":    True,
+                "fields":     fields_list,
+                "raw_text":   summary,
+                "table_html": table_html,
+                "ocr_count":  len(ocr_results),
+                "cells":      cells,
+                "num_rows":   num_rows,
+                "num_cols":   num_cols,
+                "exports":    exports,
+                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

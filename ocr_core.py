@@ -116,9 +116,13 @@ class PPStructureV3Pool:
                 _log('[PPStructureV3] 正在配置推理设备...')
                 # 尝试使用 GPU 加速，如果不可用则回退到 CPU
                 device = 'cpu'
+                cpu_threads = 8
+                enable_mkldnn = True
                 try:
                     paddle.device.set_device('gpu')
                     device = 'gpu'
+                    cpu_threads = None
+                    enable_mkldnn = False
                     _log('[PPStructureV3] 检测到 GPU，将使用 GPU 加速推理')
                     try:
                         gpu_info = paddle.device.cuda.device_count()
@@ -126,8 +130,8 @@ class PPStructureV3Pool:
                     except Exception:
                         pass
                 except Exception as e:
-                    _log(f'[PPStructureV3] GPU 不可用，将使用 CPU 推理: {e}')
-                
+                    _log(f'[PPStructureV3] GPU 不可用，将使用 CPU 推理 (mkldnn={enable_mkldnn}, threads={cpu_threads}): {e}')
+
                 _log('[PPStructureV3] 正在加载 PP-OCRv5 检测模型...')
                 t0 = time.time()
                 self._engine = PPStructureV3(
@@ -140,7 +144,9 @@ class PPStructureV3Pool:
                     use_seal_recognition=False,           # 关闭印章识别
                     use_formula_recognition=False,         # 关闭公式识别
                     use_chart_recognition=False,          # 关闭图表识别
-                    device=device,
+                    device=device,                        # gpu/cpu
+                    cpu_threads=cpu_threads,               # CPU 线程数
+                    enable_mkldnn=enable_mkldnn,        # 启用 MKL-DNN 加速
                 )
                 _log(f'[PPStructureV3] ✓ 引擎初始化完成，耗时 {time.time()-t0:.1f}s')
                 self._ready = True
@@ -244,12 +250,16 @@ class PaddleOCREnginePool:
                 _log('[FastOCR] 正在配置推理设备...')
 
                 device = 'cpu'
+                cpu_threads = 8
+                enable_mkldnn = True
                 try:
                     paddle.device.set_device('gpu')
                     device = 'gpu'
+                    cpu_threads = None
+                    enable_mkldnn = False
                     _log('[FastOCR] 检测到 GPU，将使用 GPU 加速推理')
                 except Exception as e:
-                    _log(f'[FastOCR] GPU 不可用，将使用 CPU 推理: {e}')
+                    _log(f'[FastOCR] GPU 不可用，将使用 CPU 推理 (mkldnn={enable_mkldnn}, threads={cpu_threads}): {e}')
 
                 _log('[FastOCR] 正在加载 PP-OCRv5 检测模型...')
                 _log('[FastOCR] 正在加载 PP-OCRv5 识别模型...')
@@ -259,6 +269,9 @@ class PaddleOCREnginePool:
                     rec_model_dir=REC_MODEL_DIR,
                     use_angle_cls=False,          # 关闭角度分类
                     rec_batch_num=16,            # 批量识别
+                    device=device,               # gpu/cpu
+                    cpu_threads=cpu_threads,       # CPU 线程数
+                    enable_mkldnn=enable_mkldnn, # 启用 MKL-DNN 加速
                 )
                 _log(f'[FastOCR] ✓ 引擎初始化完成，耗时 {time.time()-t0:.1f}s')
                 self._ready = True
