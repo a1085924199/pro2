@@ -862,7 +862,7 @@ async def ocr_repair_order(
         sys.stdout.flush()
 
     _log(f'收到识别请求，文件名: {file.filename}')
-    _log(f'use_fastgpt={use_fastgpt}, fast_batch={fast_batch}, mode={mode}')
+    _log(f'use_fastgpt={use_fastgpt}, mode={mode}')
     tmp_path = _save_upload(file)
     _log(f'临时文件已保存: {tmp_path}')
     session_dir = _create_session_dir()

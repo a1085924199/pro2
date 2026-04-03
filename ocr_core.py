@@ -659,12 +659,7 @@ class DocParser:
                                     'fields_def': json.dumps([{'field': f} for f in self.FIELDS], ensure_ascii=False)},
                       'messages': [{'role': 'user', 'content': prompt}]},
                 timeout=30)
-            _log(f'[_extract_fastgpt] FastGPT 响应状态码: {resp.status_code}')
-            if resp.status_code == 200:
-                resp_data = resp.json()
-                _log(f'[_extract_fastgpt] FastGPT 响应原始数据: {json.dumps(resp_data, ensure_ascii=False)[:500]}')
-                
-                # 提取 content（可能嵌套在 choices 中）
+            # 提取 content（可能嵌套在 choices 中）
                 content = ''
                 if isinstance(resp_data, dict):
                     content = resp_data.get('choices', [{}])[0].get('message', {}).get('content', '')
@@ -679,10 +674,7 @@ class DocParser:
                                     content = val
                                 break
                 
-                _log(f'[_extract_fastgpt] 提取的 content: {content[:300] if content else "(空)"}')
-                
                 if not content:
-                    _log(f'[_extract_fastgpt] 警告: FastGPT 返回的 content 为空，使用原始 OCR 识别结果')
                     return self.extract_fields(texts, table_regions)
                 
                 # 清理 content：去除代码块标记
@@ -703,18 +695,16 @@ class DocParser:
                 # 方法1：直接解析
                 try:
                     parsed = json.loads(clean_content)
-                    _log(f'[_extract_fastgpt] 方法1成功：直接解析 JSON')
                 except json.JSONDecodeError:
                     # 方法2：尝试从 content 中提取 JSON 对象
                     m = re.search(r'\{[\s\S]*\}', clean_content, re.DOTALL)
                     if m:
                         try:
                             parsed = json.loads(m.group())
-                            _log(f'[_extract_fastgpt] 方法2成功：从文本中提取并解析 JSON')
                         except json.JSONDecodeError:
-                            _log(f'[_extract_fastgpt] 方法2失败')
+                            pass
                     else:
-                        _log(f'[_extract_fastgpt] 方法2失败：未找到 JSON 对象')
+                        pass
                 
                 # 方法3：如果 parsed 是字符串，尝试再次解析（处理嵌套 JSON）
                 if parsed is not None:
@@ -722,24 +712,20 @@ class DocParser:
                         # content 本身可能是 JSON 字符串，需要再次解析
                         try:
                             parsed = json.loads(parsed)
-                            _log(f'[_extract_fastgpt] 方法3成功：解析嵌套 JSON 字符串')
                         except json.JSONDecodeError:
                             m2 = re.search(r'\{[\s\S]*\}', parsed, re.DOTALL)
                             if m2:
                                 try:
                                     parsed = json.loads(m2.group())
-                                    _log(f'[_extract_fastgpt] 方法3成功：从嵌套字符串中提取并解析 JSON')
                                 except json.JSONDecodeError:
-                                    _log(f'[_extract_fastgpt] 方法3失败')
                                     parsed = None
                             else:
-                                _log(f'[_extract_fastgpt] 方法3失败：未找到 JSON 对象')
+                                parsed = None
                     elif isinstance(parsed, dict):
                         # 检查是否需要从嵌套结构中提取
                         if 'data' in parsed and isinstance(parsed['data'], str):
                             try:
                                 parsed = json.loads(parsed['data'])
-                                _log(f'[_extract_fastgpt] 方法3成功：从 data 字段解析嵌套 JSON')
                             except json.JSONDecodeError:
                                 pass
                 
@@ -748,17 +734,13 @@ class DocParser:
                     for fn, val in parsed.items():
                         if fn in result:
                             result[fn] = str(val) if val else ''
-                    _log(f'[_extract_fastgpt] 成功解析 FastGPT 结果: {result}')
                     return result
                 elif parsed and isinstance(parsed, list):
                     for item in parsed:
                         fn = item.get('field', '')
                         if fn in result:
                             result[fn] = item.get('value', '')
-                    _log(f'[_extract_fastgpt] 成功解析 FastGPT 结果（列表格式）: {result}')
                     return result
-                else:
-                    _log(f'[_extract_fastgpt] 无法解析 FastGPT 响应，使用原始 OCR 识别结果')
         except Exception as e:
             print(f'FastGPT调用失败({self.__class__.__name__}): {e}')
         # 超时或解析失败时回退到规则提取（传入完整 OCR 文本供匹配）
