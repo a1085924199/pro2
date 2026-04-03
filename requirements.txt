@@ -6,4 +6,5 @@ opencv-python
 numpy
 requests
 openpyxl
+pandas
 Pillow

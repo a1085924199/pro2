@@ -13,6 +13,7 @@ server.py - FastAPI OCR 后端服务 v2.0
   POST /api/ocr/material          - 航材出入库单识别
   POST /api/ocr/general           - 通用文档/表格 OCR 识别
   POST /api/ocr/table-structure   - PP-Structure 表格识别
+  POST /api/ocr/repair-archive/merge - 调修单+返修卡批量表合并为返修件档案
   GET  /api/health                - 健康检查
   GET  /api/config/fastgpt        - 读取 FastGPT 配置
   POST /api/config/fastgpt        - 保存 FastGPT 配置
@@ -1359,6 +1360,57 @@ async def export_repair_batch(
         "success": True,
         "exports": exports,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+@app.post("/api/ocr/repair-archive/merge")
+async def merge_repair_archive(
+    repair_order_xlsx: UploadFile = File(...),
+    repair_card_xlsx: UploadFile = File(...),
+    join_type: str = Form("inner"),
+):
+    """
+    上传「调修单批量识别表」「返修卡批量识别表」两个 xlsx（与导出模板列名一致），
+    按 装备型号=产品代号、器材名称=返修件名称、器件编号=批次号、型（图）号=图号 四键合并，
+    生成「返修件档案.xlsx」。join_type: inner | left（左连以返修卡为主）。
+    """
+    if join_type not in ("inner", "left"):
+        raise HTTPException(status_code=400, detail="join_type 须为 inner 或 left")
+    from repair_archive_merge import build_repair_archive_xlsx
+
+    out_root = _get_output_dir()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out_name = f"返修件档案_{ts}.xlsx"
+    out_path = os.path.join(out_root, out_name)
+    td = tempfile.mkdtemp()
+    try:
+        order_path = os.path.join(td, "order.xlsx")
+        card_path = os.path.join(td, "card.xlsx")
+        bo = await repair_order_xlsx.read()
+        bc = await repair_card_xlsx.read()
+        if not bo or not bc:
+            raise HTTPException(status_code=400, detail="请上传非空的 xlsx 文件")
+        with open(order_path, "wb") as f:
+            f.write(bo)
+        with open(card_path, "wb") as f:
+            f.write(bc)
+        stats = build_repair_archive_xlsx(order_path, card_path, out_path, join_type=join_type)  # type: ignore[arg-type]
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+    return {
+        "success": True,
+        "exports": {"excel": out_path},
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "filename": out_name,
+        **stats,
     }
 
 

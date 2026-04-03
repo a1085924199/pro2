@@ -659,88 +659,87 @@ class DocParser:
                                     'fields_def': json.dumps([{'field': f} for f in self.FIELDS], ensure_ascii=False)},
                       'messages': [{'role': 'user', 'content': prompt}]},
                 timeout=30)
-            # 提取 content（可能嵌套在 choices 中）
-                content = ''
-                if isinstance(resp_data, dict):
-                    content = resp_data.get('choices', [{}])[0].get('message', {}).get('content', '')
-                    if not content:
-                        # 尝试直接从响应中获取 JSON
-                        for key in ['data', 'result', 'response']:
-                            if key in resp_data:
-                                val = resp_data[key]
-                                if isinstance(val, dict):
-                                    content = val.get('content', val.get('text', str(val)))
-                                elif isinstance(val, str):
-                                    content = val
-                                break
-                
+            resp_data = resp.json()
+            content = ''
+            if isinstance(resp_data, dict):
+                content = resp_data.get('choices', [{}])[0].get('message', {}).get('content', '')
                 if not content:
-                    return self.extract_fields(texts, table_regions)
+                    for key in ['data', 'result', 'response']:
+                        if key in resp_data:
+                            val = resp_data[key]
+                            if isinstance(val, dict):
+                                content = val.get('content', val.get('text', str(val)))
+                            elif isinstance(val, str):
+                                content = val
+                            break
+
+            if not content:
+                return self.extract_fields(texts, table_regions)
+
+            # 清理 content：去除代码块标记
+            clean_content = content.strip()
+            if clean_content.startswith('```'):
+                # 去除 ```json 或 ``` 等标记
+                lines = clean_content.split('\n')
+                if lines[0].startswith('```'):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith('```'):
+                    lines = lines[:-1]
+                clean_content = '\n'.join(lines).strip()
                 
-                # 清理 content：去除代码块标记
-                clean_content = content.strip()
-                if clean_content.startswith('```'):
-                    # 去除 ```json 或 ``` 等标记
-                    lines = clean_content.split('\n')
-                    if lines[0].startswith('```'):
-                        lines = lines[1:]
-                    if lines and lines[-1].startswith('```'):
-                        lines = lines[:-1]
-                    clean_content = '\n'.join(lines).strip()
-                
-                # 尝试多层解析：先尝试直接解析，然后尝试解析嵌套的 JSON
-                result = {f: '' for f in self.FIELDS}
-                parsed = None
-                
-                # 方法1：直接解析
-                try:
-                    parsed = json.loads(clean_content)
-                except json.JSONDecodeError:
-                    # 方法2：尝试从 content 中提取 JSON 对象
-                    m = re.search(r'\{[\s\S]*\}', clean_content, re.DOTALL)
-                    if m:
+            # 尝试多层解析：先尝试直接解析，然后尝试解析嵌套的 JSON
+            result = {f: '' for f in self.FIELDS}
+            parsed = None
+
+            # 方法1：直接解析
+            try:
+                parsed = json.loads(clean_content)
+            except json.JSONDecodeError:
+                # 方法2：尝试从 content 中提取 JSON 对象
+                m = re.search(r'\{[\s\S]*\}', clean_content, re.DOTALL)
+                if m:
+                    try:
+                        parsed = json.loads(m.group())
+                    except json.JSONDecodeError:
+                        pass
+                else:
+                    pass
+
+            # 方法3：如果 parsed 是字符串，尝试再次解析（处理嵌套 JSON）
+            if parsed is not None:
+                if isinstance(parsed, str):
+                    # content 本身可能是 JSON 字符串，需要再次解析
+                    try:
+                        parsed = json.loads(parsed)
+                    except json.JSONDecodeError:
+                        m2 = re.search(r'\{[\s\S]*\}', parsed, re.DOTALL)
+                        if m2:
+                            try:
+                                parsed = json.loads(m2.group())
+                            except json.JSONDecodeError:
+                                parsed = None
+                        else:
+                            parsed = None
+                elif isinstance(parsed, dict):
+                    # 检查是否需要从嵌套结构中提取
+                    if 'data' in parsed and isinstance(parsed['data'], str):
                         try:
-                            parsed = json.loads(m.group())
+                            parsed = json.loads(parsed['data'])
                         except json.JSONDecodeError:
                             pass
-                    else:
-                        pass
-                
-                # 方法3：如果 parsed 是字符串，尝试再次解析（处理嵌套 JSON）
-                if parsed is not None:
-                    if isinstance(parsed, str):
-                        # content 本身可能是 JSON 字符串，需要再次解析
-                        try:
-                            parsed = json.loads(parsed)
-                        except json.JSONDecodeError:
-                            m2 = re.search(r'\{[\s\S]*\}', parsed, re.DOTALL)
-                            if m2:
-                                try:
-                                    parsed = json.loads(m2.group())
-                                except json.JSONDecodeError:
-                                    parsed = None
-                            else:
-                                parsed = None
-                    elif isinstance(parsed, dict):
-                        # 检查是否需要从嵌套结构中提取
-                        if 'data' in parsed and isinstance(parsed['data'], str):
-                            try:
-                                parsed = json.loads(parsed['data'])
-                            except json.JSONDecodeError:
-                                pass
-                
-                # 应用解析结果
-                if parsed and isinstance(parsed, dict):
-                    for fn, val in parsed.items():
-                        if fn in result:
-                            result[fn] = str(val) if val else ''
-                    return result
-                elif parsed and isinstance(parsed, list):
-                    for item in parsed:
-                        fn = item.get('field', '')
-                        if fn in result:
-                            result[fn] = item.get('value', '')
-                    return result
+
+            # 应用解析结果
+            if parsed and isinstance(parsed, dict):
+                for fn, val in parsed.items():
+                    if fn in result:
+                        result[fn] = str(val) if val else ''
+                return result
+            elif parsed and isinstance(parsed, list):
+                for item in parsed:
+                    fn = item.get('field', '')
+                    if fn in result:
+                        result[fn] = item.get('value', '')
+                return result
         except Exception as e:
             print(f'FastGPT调用失败({self.__class__.__name__}): {e}')
         # 超时或解析失败时回退到规则提取（传入完整 OCR 文本供匹配）

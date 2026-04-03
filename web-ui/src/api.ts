@@ -109,6 +109,40 @@ export async function exportRepairBatch(
   return res.data
 }
 
+/** 调修单批量 + 返修卡批量 xlsx → 返修件档案.xlsx */
+export interface RepairArchiveMergeResponse {
+  success: boolean
+  exports: Record<string, string>
+  timestamp: string
+  filename?: string
+  rows_out: number
+  rows_order: number
+  rows_card: number
+  join_type: string
+  duplicate_key_groups: number
+}
+
+export async function mergeRepairArchive(
+  orderXlsx: File,
+  cardXlsx: File,
+  joinType: 'inner' | 'left' = 'inner',
+): Promise<RepairArchiveMergeResponse> {
+  const form = new FormData()
+  form.append('repair_order_xlsx', orderXlsx)
+  form.append('repair_card_xlsx', cardXlsx)
+  form.append('join_type', joinType)
+  try {
+    const res = await api.post<RepairArchiveMergeResponse>('/ocr/repair-archive/merge', form, { timeout: 120000 })
+    return res.data
+  } catch (e: unknown) {
+    if (axios.isAxiosError(e) && e.response?.data && typeof e.response.data === 'object') {
+      const d = (e.response.data as { detail?: string }).detail
+      if (typeof d === 'string') throw new Error(d)
+    }
+    throw e
+  }
+}
+
 // ─── 调修单结果导出 ──────────────────────────────────────────
 export interface ExportRepairOrderOpts {
   /** repair_order：横向模板 + 原图；repair_card：返修卡横向模板 + 末列原图 */

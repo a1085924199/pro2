@@ -25,6 +25,7 @@ import {
   ocrRepairCardBatch,
   exportRepairOrder,
   exportRepairBatch,
+  mergeRepairArchive,
   getFastgptConfig,
   saveFastgptConfig,
   downloadExportFile,
@@ -69,10 +70,40 @@ interface StepState {
   fastBatch?: boolean
   /** 引擎模式: 'slow' | 'fast' */
   mode?: 'slow' | 'fast'
+  /** 步骤 3：返修件档案合并 */
+  archiveOrderXlsx?: File | null
+  archiveCardXlsx?: File | null
+  archiveJoinType?: 'inner' | 'left'
+  archiveStats?: {
+    rows_out: number
+    rows_order: number
+    rows_card: number
+    join_type: string
+    duplicate_key_groups: number
+  }
+  archiveExportFilename?: string
 }
 
 function initState(): StepState {
-  return { status: 'idle', files: [], results: [], info: '', progress_detail: '', cachedFields: undefined, recognizedAt: undefined, rawExports: undefined, fastgptUsed: undefined, batchResults: undefined, fastBatch: false, mode: 'slow' }
+  return {
+    status: 'idle',
+    files: [],
+    results: [],
+    info: '',
+    progress_detail: '',
+    cachedFields: undefined,
+    recognizedAt: undefined,
+    rawExports: undefined,
+    fastgptUsed: undefined,
+    batchResults: undefined,
+    fastBatch: false,
+    mode: 'slow',
+    archiveOrderXlsx: null,
+    archiveCardXlsx: null,
+    archiveJoinType: 'inner',
+    archiveStats: undefined,
+    archiveExportFilename: undefined,
+  }
 }
 
 const EMPTY_FGPT: StepFastgptConfig = { api_url: '', api_key: '', appid: '', enabled: false }
@@ -201,12 +232,40 @@ export default function ReturnRepairPage() {
   const handleProcess = async (idx: number) => {
     // 步骤 2、3 为模拟链路（档案生成、IDS+报价一体化）
     if (idx === 2) {
-      updateStep(idx, { status: 'processing', progress_detail: '正在融合调修单与返修卡信息...' })
-      const progressSteps = ['正在读取调修单数据...', '正在读取返修卡数据...', '正在智能融合信息...', '档案生成完成']
-      const interval = animateProgress(idx, progressSteps)
-      await new Promise((r) => setTimeout(r, 1200))
-      clearInterval(interval)
-      updateStep(idx, { status: 'done', results: [], info: '', progress_detail: '' })
+      const st = stepStates[2]
+      if (!st.archiveOrderXlsx || !st.archiveCardXlsx) {
+        messageApi.warning('请分别上传调修单批量与返修卡批量的 .xlsx 文件')
+        return
+      }
+      updateStep(2, { status: 'processing', progress_detail: '正在读取与匹配表格...', info: '' })
+      try {
+        const resp = await mergeRepairArchive(st.archiveOrderXlsx, st.archiveCardXlsx, st.archiveJoinType ?? 'inner')
+        const filename =
+          resp.filename ||
+          (resp.exports?.excel ? resp.exports.excel.split(/[/\\]/).pop() : undefined) ||
+          '返修件档案.xlsx'
+        if (resp.exports?.excel) {
+          downloadExportFile(filename)
+        }
+        updateStep(2, {
+          status: 'done',
+          progress_detail: '',
+          archiveStats: {
+            rows_out: resp.rows_out,
+            rows_order: resp.rows_order,
+            rows_card: resp.rows_card,
+            join_type: resp.join_type,
+            duplicate_key_groups: resp.duplicate_key_groups,
+          },
+          archiveExportFilename: filename,
+          info: `已生成 ${resp.rows_out} 条档案记录（调修单 ${resp.rows_order} 行，返修卡 ${resp.rows_card} 行）`,
+        })
+        messageApi.success('返修件档案已生成并开始下载')
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e)
+        updateStep(2, { status: 'error', info: msg, progress_detail: '' })
+        messageApi.error(`档案生成失败：${msg}`)
+      }
       return
     }
     if (idx === 3) {
@@ -446,7 +505,7 @@ export default function ReturnRepairPage() {
               </div>
               <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
                 {/* FastGPT 状态徽章 */}
-                {(isMergedIdsQuoteStep ? mergedFgptEnabled : sc.enabled) && (
+                {current !== 2 && (isMergedIdsQuoteStep ? mergedFgptEnabled : sc.enabled) && (
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'rgba(0,212,170,0.1)', border: '1px solid rgba(0,212,170,0.3)', borderRadius: 20, padding: '2px 10px', fontSize: 11, color: '#00d4aa', fontWeight: 600 }}>
                     <ThunderboltOutlined style={{ fontSize: 10 }} /> FastGPT 已启用
                   </span>
@@ -455,20 +514,22 @@ export default function ReturnRepairPage() {
                   {state.status === 'done' ? '✓ 已完成' : state.status === 'processing' ? '处理中' : state.status === 'error' ? '✗ 失败' : '待处理'}
                 </Tag>
                 {/* 配置按钮 */}
-                <Button
-                  size="small"
-                  icon={<SettingOutlined />}
-                  onClick={() => setShowCfg((prev) => prev.map((v, i) => (i === current ? !v : v)))}
-                  style={{ background: showCfg[current] ? `${step.color}20` : '#21262d', borderColor: showCfg[current] ? step.color : '#30363d', color: showCfg[current] ? step.color : '#7d8590', fontSize: 12 }}
-                >
-                  {cfgLoading ? '加载中...' : 'FastGPT 配置'}
-                </Button>
+                {current !== 2 && (
+                  <Button
+                    size="small"
+                    icon={<SettingOutlined />}
+                    onClick={() => setShowCfg((prev) => prev.map((v, i) => (i === current ? !v : v)))}
+                    style={{ background: showCfg[current] ? `${step.color}20` : '#21262d', borderColor: showCfg[current] ? step.color : '#30363d', color: showCfg[current] ? step.color : '#7d8590', fontSize: 12 }}
+                  >
+                    {cfgLoading ? '加载中...' : 'FastGPT 配置'}
+                  </Button>
+                )}
               </div>
             </div>
 
             {/* FastGPT 配置面板（可折叠） */}
             <AnimatePresence>
-              {showCfg[current] && (
+              {showCfg[current] && current !== 2 && (
                 <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.2 }} style={{ overflow: 'hidden' }}>
                   {isMergedIdsQuoteStep ? (
                     <>
@@ -532,12 +593,102 @@ export default function ReturnRepairPage() {
               </div>
             )}
 
-            {/* 返修件档案生成 — 待处理说明 */}
-            {current === 2 && state.status !== 'done' && (
-              <div style={{ padding: 24, borderRadius: 10, background: '#1c2128', border: '1px solid #21262d', marginBottom: 24, textAlign: 'center' }}>
-                <ApiOutlined style={{ fontSize: 36, color: '#f0a020', display: 'block', marginBottom: 12 }} />
-                <p style={{ color: '#7d8590', margin: 0 }}>调修单与返修卡信息智能关联融合，形成返修件档案</p>
-                <p style={{ color: '#484f58', fontSize: 12, margin: '4px 0 0' }}>需要前两步骤均已完成</p>
+            {/* 返修件档案：上传两个批量 xlsx */}
+            {current === 2 && (
+              <div style={{ marginBottom: 24 }}>
+                <div
+                  style={{
+                    padding: 20,
+                    borderRadius: 10,
+                    background: '#1c2128',
+                    border: '1px solid #21262d',
+                    marginBottom: 20,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+                    <ApiOutlined style={{ fontSize: 22, color: '#f0a020' }} />
+                    <span style={{ color: '#e6edf3', fontWeight: 600, fontSize: 14 }}>上传前两步导出的批量 Excel（.xlsx）</span>
+                  </div>
+                  <p style={{ color: '#7d8590', fontSize: 12, margin: '0 0 10px', lineHeight: 1.6 }}>
+                    四键完全一致视为同一返修件：<b style={{ color: '#a8b0ba' }}>装备型号</b>↔产品代号、<b style={{ color: '#a8b0ba' }}>器材名称</b>↔返修件名称、
+                    <b style={{ color: '#a8b0ba' }}>器件编号</b>↔批次号、<b style={{ color: '#a8b0ba' }}>型（图）号</b>↔图号。键值会自动去首尾空格并转为字符串比对。
+                  </p>
+                  <ul style={{ color: '#484f58', fontSize: 11, margin: 0, paddingLeft: 18 }}>
+                    <li>输出列：返修卡侧字段 + 调修单号 / 邮寄地址 / 进厂时间，以及两侧原图缩略图（返修卡原图、调修单原图）。</li>
+                    <li>文件需与本系统批量导出模板列名一致（首个工作表）。</li>
+                  </ul>
+                </div>
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                    gap: 16,
+                    marginBottom: 16,
+                  }}
+                >
+                  <div>
+                    <div style={{ color: '#7d8590', fontSize: 12, fontWeight: 600, marginBottom: 8 }}>调修单批量识别表</div>
+                    <UploadZone
+                      accept={{
+                        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+                      }}
+                      multiple={false}
+                      label="拖拽或点击上传调修单批量 .xlsx"
+                      hint="步骤 1 批量导出文件"
+                      onFiles={(files) =>
+                        updateStep(2, {
+                          archiveOrderXlsx: files[0] ?? null,
+                          status: 'idle',
+                          archiveStats: undefined,
+                          archiveExportFilename: undefined,
+                          info: '',
+                        })
+                      }
+                    />
+                    {state.archiveOrderXlsx && (
+                      <p style={{ color: '#484f58', fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+                        已绑定文件：{state.archiveOrderXlsx.name}
+                      </p>
+                    )}
+                  </div>
+                  <div>
+                    <div style={{ color: '#7d8590', fontSize: 12, fontWeight: 600, marginBottom: 8 }}>返修卡批量识别表</div>
+                    <UploadZone
+                      accept={{
+                        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+                      }}
+                      multiple={false}
+                      label="拖拽或点击上传返修卡批量 .xlsx"
+                      hint="步骤 2 批量导出文件"
+                      onFiles={(files) =>
+                        updateStep(2, {
+                          archiveCardXlsx: files[0] ?? null,
+                          status: 'idle',
+                          archiveStats: undefined,
+                          archiveExportFilename: undefined,
+                          info: '',
+                        })
+                      }
+                    />
+                    {state.archiveCardXlsx && (
+                      <p style={{ color: '#484f58', fontSize: 11, marginTop: 8, marginBottom: 0 }}>
+                        已绑定文件：{state.archiveCardXlsx.name}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 12, marginBottom: 8 }}>
+                  <span style={{ color: '#7d8590', fontSize: 13 }}>合并方式</span>
+                  <Radio.Group
+                    value={state.archiveJoinType ?? 'inner'}
+                    onChange={(e) => updateStep(2, { archiveJoinType: e.target.value })}
+                    buttonStyle="solid"
+                    size="small"
+                  >
+                    <Radio.Button value="inner">内连接（仅双方四键都匹配）</Radio.Button>
+                    <Radio.Button value="left">左连接（以返修卡为主，未匹配则调修单字段为空）</Radio.Button>
+                  </Radio.Group>
+                </div>
               </div>
             )}
 
@@ -555,15 +706,22 @@ export default function ReturnRepairPage() {
                 type="primary"
                 icon={<PlayCircleOutlined />}
                 loading={state.status === 'processing'}
-                disabled={current < 2 && state.files.length === 0}
+                disabled={
+                  (current < 2 && state.files.length === 0) ||
+                  (current === 2 && (!state.archiveOrderXlsx || !state.archiveCardXlsx))
+                }
                 onClick={() => handleProcess(current)}
                 style={{ background: step.color, borderColor: step.color, boxShadow: `0 4px 14px ${step.color}50` }}
               >
                 {state.status === 'processing'
-                  ? '识别中...'
-                  : state.files.length > 1
-                    ? `批量识别 ${state.files.length} 张`
-                    : '开始处理'}
+                  ? current === 2
+                    ? '正在生成档案...'
+                    : '识别中...'
+                  : current === 2
+                    ? '生成返修件档案'
+                    : state.files.length > 1
+                      ? `批量识别 ${state.files.length} 张`
+                      : '开始处理'}
               </Button>
               {/* 进度详情显示 */}
               {state.status === 'processing' && state.progress_detail && (
@@ -747,6 +905,24 @@ export default function ReturnRepairPage() {
                     data={state.results}
                     onExport={current < 2 ? () => handleExport(current, 'excel') : undefined}
                   />
+                </motion.div>
+              )}
+              {current === 2 && state.status === 'done' && state.archiveStats && (
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                  <Divider style={{ borderColor: '#21262d', margin: '0 0 16px' }} />
+                  {state.info && <p style={{ color: '#e6edf3', fontSize: 14, marginBottom: 10 }}>{state.info}</p>}
+                  <p style={{ color: '#7d8590', fontSize: 12, marginBottom: 14 }}>
+                    合并方式：{state.archiveStats.join_type === 'inner' ? '内连接' : '左连接'} · 存在多行同四键的组数：{state.archiveStats.duplicate_key_groups}
+                  </p>
+                  {state.archiveExportFilename && (
+                    <Button
+                      icon={<DownloadOutlined />}
+                      onClick={() => downloadExportFile(state.archiveExportFilename!)}
+                      style={{ background: '#1f883d', borderColor: '#1f883d', color: '#fff' }}
+                    >
+                      再次下载 返修件档案
+                    </Button>
+                  )}
                 </motion.div>
               )}
             </AnimatePresence>

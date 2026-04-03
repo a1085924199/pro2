@@ -61,6 +61,8 @@ a = Analysis(
         # 工具库
         'yaml', 'requests', 'requests.adapters',
         'openpyxl', 'openpyxl.styles', 'openpyxl.worksheet',
+        'pandas', 'pandas._libs.tslibs.timedeltas',
+        'repair_archive_merge',
         'tqdm', 'colorama',
         # 标准库
         'json', 'os', 'sys', 'pathlib', 'datetime', 're', 'io', 'logging', 'warnings',
