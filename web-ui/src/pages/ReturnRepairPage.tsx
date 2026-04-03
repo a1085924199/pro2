@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Steps, Button, Tag, Divider, Switch, Input, message, Dropdown, Table } from 'antd'
+import { Steps, Button, Tag, Divider, Switch, Input, message, Dropdown, Table, Radio } from 'antd'
 import {
   ScanOutlined,
   FileSearchOutlined,
@@ -37,8 +37,7 @@ const STEPS = [
   { key: 'repair_order_ocr' as keyof FastgptConfig, title: '调修单 OCR 识别', description: '维修器材调修单扫描件识别', icon: <ScanOutlined />, color: '#3378ff' },
   { key: 'repair_card_ocr' as keyof FastgptConfig,  title: '返修卡 OCR 识别', description: '返修件返修卡扫描件识别',   icon: <FileSearchOutlined />, color: '#00d4aa' },
   { key: 'archive_generation' as keyof FastgptConfig, title: '返修件档案生成', description: '调修单与返修卡信息智能融合', icon: <ApiOutlined />, color: '#f0a020' },
-  { key: 'ids_match' as keyof FastgptConfig,        title: '报价信息关联',   description: '提取IDS系统数据进行信息匹配', icon: <ApiOutlined />, color: '#f0a020' },
-  { key: 'quote_generation' as keyof FastgptConfig, title: '报价数据生成',   description: '智能信息汇总，生成报价单',    icon: <DollarOutlined />, color: '#a855f7' },
+  { key: 'ids_match' as keyof FastgptConfig,        title: '报价方案智能生成', description: '智能生成报价方案', icon: <DollarOutlined />, color: '#a855f7' },
 ]
 
 interface BatchResultItem {
@@ -68,10 +67,12 @@ interface StepState {
   batchResults?: BatchResultItem[]
   /** 批量模式下是否使用快速识别 */
   fastBatch?: boolean
+  /** 引擎模式: 'slow' | 'fast' */
+  mode?: 'slow' | 'fast'
 }
 
 function initState(): StepState {
-  return { status: 'idle', files: [], results: [], info: '', progress_detail: '', cachedFields: undefined, recognizedAt: undefined, rawExports: undefined, fastgptUsed: undefined, batchResults: undefined, fastBatch: false }
+  return { status: 'idle', files: [], results: [], info: '', progress_detail: '', cachedFields: undefined, recognizedAt: undefined, rawExports: undefined, fastgptUsed: undefined, batchResults: undefined, fastBatch: false, mode: 'slow' }
 }
 
 const EMPTY_FGPT: StepFastgptConfig = { api_url: '', api_key: '', appid: '', enabled: false }
@@ -198,7 +199,7 @@ export default function ReturnRepairPage() {
   }
 
   const handleProcess = async (idx: number) => {
-    // 步骤 2、3、4 为模拟链路（档案生成、报价信息关联、报价数据生成）
+    // 步骤 2、3 为模拟链路（档案生成、IDS+报价一体化）
     if (idx === 2) {
       updateStep(idx, { status: 'processing', progress_detail: '正在融合调修单与返修卡信息...' })
       const progressSteps = ['正在读取调修单数据...', '正在读取返修卡数据...', '正在智能融合信息...', '档案生成完成']
@@ -210,20 +211,19 @@ export default function ReturnRepairPage() {
     }
     if (idx === 3) {
       updateStep(idx, { status: 'processing', progress_detail: '正在连接 IDS 系统...' })
-      const progressSteps = ['正在连接 IDS 系统...', '正在获取设备信息...', '正在匹配置信度计算...', '匹配完成']
+      const progressSteps = [
+        '正在连接 IDS 系统...',
+        '正在获取设备信息...',
+        '正在匹配置信度计算...',
+        '正在汇总报价数据...',
+        '正在生成报价方案...',
+        '正在计算费用明细...',
+        '报价方案生成完成',
+      ]
       const interval = animateProgress(idx, progressSteps)
-      await new Promise((r) => setTimeout(r, 1200))
+      await new Promise((r) => setTimeout(r, progressSteps.length * 800 + 400))
       clearInterval(interval)
-      updateStep(idx, { status: 'done', results: IDS_MOCK, info: '', progress_detail: '' })
-      return
-    }
-    if (idx === 4) {
-      updateStep(idx, { status: 'processing', progress_detail: '正在汇总报价数据...' })
-      const progressSteps = ['正在汇总数据...', '正在生成报价...', '正在计算费用明细...', '报价生成完成']
-      const interval = animateProgress(idx, progressSteps)
-      await new Promise((r) => setTimeout(r, 1200))
-      clearInterval(interval)
-      updateStep(idx, { status: 'done', results: QUOTE_MOCK, info: '', progress_detail: '' })
+      updateStep(idx, { status: 'done', results: [...IDS_MOCK, ...QUOTE_MOCK], info: '', progress_detail: '' })
       return
     }
     const state = stepStates[idx]
@@ -231,9 +231,10 @@ export default function ReturnRepairPage() {
 
     const sc = fgptCfg[STEPS[idx].key]
     const fastBatch = state.files.length > 1
+    const mode = state.mode ?? 'slow'
     const commonOpts = sc.enabled
-      ? { useFastgpt: true, apiUrl: sc.api_url, apiKey: sc.api_key, appid: sc.appid, fastBatch }
-      : { useFastgpt: false, fastBatch }
+      ? { useFastgpt: true, apiUrl: sc.api_url, apiKey: sc.api_key, appid: sc.appid, fastBatch, mode }
+      : { useFastgpt: false, fastBatch, mode }
 
     if (fastBatch) {
       // ── 批量模式 ──────────────────────────────────────────────
@@ -243,6 +244,9 @@ export default function ReturnRepairPage() {
           ? await ocrRepairOrderBatch(state.files, commonOpts)
           : await ocrRepairCardBatch(state.files, commonOpts)
 
+        if (!resp) {
+          throw new Error('后端返回空响应，请检查服务是否正常运行')
+        }
         const items: BatchResultItem[] = resp.results.map(r => ({
           filename: r.filename,
           fields: r.fields,
@@ -252,12 +256,14 @@ export default function ReturnRepairPage() {
           error: r.error,
         }))
         const successCount = items.filter(r => !r.error).length
+        const batchMode = resp.mode
         updateStep(idx, {
           status: 'done',
           batchResults: items,
           results: [],
           info: `批量识别完成：${successCount}/${state.files.length} 张成功`,
           progress_detail: '',
+          mode: batchMode === 'slow' || batchMode === 'fast' ? batchMode : 'slow',
         })
         messageApi.success(`批量识别完成：${successCount}/${state.files.length} 张成功`)
       } catch (e: unknown) {
@@ -275,6 +281,9 @@ export default function ReturnRepairPage() {
           ? await ocrRepairOrder(state.files[0], commonOpts)
           : await ocrRepairCard(state.files[0], commonOpts)
         clearInterval(interval)
+        if (!resp) {
+          throw new Error('后端返回空响应，请检查服务是否正常运行')
+        }
         updateStep(idx, {
           status: 'done',
           results: resp.fields,
@@ -285,6 +294,7 @@ export default function ReturnRepairPage() {
           rawExports: resp.raw_exports,
           fastgptUsed: resp.fastgpt_used,
           fastBatch: resp.fast_batch,
+          mode: resp.mode,
         })
         messageApi.success(`步骤 ${idx + 1} 识别完成`)
       } catch (e: unknown) {
@@ -377,6 +387,8 @@ export default function ReturnRepairPage() {
   const step  = STEPS[current]
   const state = stepStates[current]
   const sc    = fgptCfg[step.key]
+  const isMergedIdsQuoteStep = current === STEPS.length - 1 && step.key === 'ids_match'
+  const mergedFgptEnabled = fgptCfg.ids_match.enabled || fgptCfg.quote_generation.enabled
 
   const antStepItems = STEPS.map((s, i) => ({
     title: s.title,
@@ -434,7 +446,7 @@ export default function ReturnRepairPage() {
               </div>
               <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
                 {/* FastGPT 状态徽章 */}
-                {sc.enabled && (
+                {(isMergedIdsQuoteStep ? mergedFgptEnabled : sc.enabled) && (
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: 'rgba(0,212,170,0.1)', border: '1px solid rgba(0,212,170,0.3)', borderRadius: 20, padding: '2px 10px', fontSize: 11, color: '#00d4aa', fontWeight: 600 }}>
                     <ThunderboltOutlined style={{ fontSize: 10 }} /> FastGPT 已启用
                   </span>
@@ -458,7 +470,14 @@ export default function ReturnRepairPage() {
             <AnimatePresence>
               {showCfg[current] && (
                 <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.2 }} style={{ overflow: 'hidden' }}>
-                  <FgptPanel stepKey={step.key} cfg={fgptCfg} saving={saving} onChange={patchFgpt} onSave={handleSaveCfg} />
+                  {isMergedIdsQuoteStep ? (
+                    <>
+                      <FgptPanel stepKey="ids_match" cfg={fgptCfg} saving={saving} onChange={patchFgpt} onSave={handleSaveCfg} />
+                      <FgptPanel stepKey="quote_generation" cfg={fgptCfg} saving={saving} onChange={patchFgpt} onSave={handleSaveCfg} />
+                    </>
+                  ) : (
+                    <FgptPanel stepKey={step.key} cfg={fgptCfg} saving={saving} onChange={patchFgpt} onSave={handleSaveCfg} />
+                  )}
                 </motion.div>
               )}
             </AnimatePresence>
@@ -468,11 +487,31 @@ export default function ReturnRepairPage() {
               <div className="mb-6">
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
                   <div style={{ color: '#7d8590', fontSize: 13 }}>上传扫描件图片</div>
-                  {state.files.length > 1 && (
-                    <div style={{ color: '#00d4aa', fontSize: 12, fontWeight: 600 }}>
-                      已选择 {state.files.length} 张图片，将自动启用批量快速识别模式
-                    </div>
-                  )}
+                </div>
+                {/* 引擎模式选择 */}
+                <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 16 }}>
+                  <span style={{ color: '#7d8590', fontSize: 13 }}>引擎模式：</span>
+                  <Radio.Group
+                    value={state.mode ?? 'slow'}
+                    onChange={(e) => updateStep(current, { mode: e.target.value })}
+                    buttonStyle="solid"
+                    size="small"
+                  >
+                    <Radio.Button value="slow" disabled={state.files.length > 1}>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <ThunderboltOutlined style={{ fontSize: 11 }} /> 正常模式
+                      </span>
+                    </Radio.Button>
+                    <Radio.Button value="fast">
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <ThunderboltOutlined style={{ fontSize: 11 }} /> 快速模式
+                      </span>
+                    </Radio.Button>
+                  </Radio.Group>
+                  <span style={{ color: '#484f58', fontSize: 11 }}>
+                    {state.mode === 'fast' ? '（纯 OCR，仅文本检测识别，不生成表格）' :
+                     state.files.length > 1 ? '（批量模式仅支持快速模式）' : '（PP-StructureV3 完整流程，含表格结构识别）'}
+                  </span>
                 </div>
                 <UploadZone
                   onFiles={(files) =>
@@ -493,20 +532,20 @@ export default function ReturnRepairPage() {
               </div>
             )}
 
-            {/* IDS 步骤提示 */}
+            {/* 返修件档案生成 — 待处理说明 */}
             {current === 2 && state.status !== 'done' && (
               <div style={{ padding: 24, borderRadius: 10, background: '#1c2128', border: '1px solid #21262d', marginBottom: 24, textAlign: 'center' }}>
                 <ApiOutlined style={{ fontSize: 36, color: '#f0a020', display: 'block', marginBottom: 12 }} />
-                <p style={{ color: '#7d8590', margin: 0 }}>将调用 IDS 系统 API 进行数据匹配</p>
+                <p style={{ color: '#7d8590', margin: 0 }}>调修单与返修卡信息智能关联融合，形成返修件档案</p>
                 <p style={{ color: '#484f58', fontSize: 12, margin: '4px 0 0' }}>需要前两步骤均已完成</p>
               </div>
             )}
 
-            {/* 报价生成提示 */}
+            {/* IDS 报价一体化步骤 — 待处理说明 */}
             {current === 3 && state.status !== 'done' && (
               <div style={{ padding: 24, borderRadius: 10, background: '#1c2128', border: '1px solid #21262d', marginBottom: 24, textAlign: 'center' }}>
                 <DollarOutlined style={{ fontSize: 36, color: '#a855f7', display: 'block', marginBottom: 12 }} />
-                <p style={{ color: '#7d8590', margin: 0 }}>将汇总所有步骤数据，自动生成报价单</p>
+                <p style={{ color: '#7d8590', margin: 0 }}>提取IDS系统数据，智能生成报价方案</p>
               </div>
             )}
 
@@ -557,7 +596,7 @@ export default function ReturnRepairPage() {
                   {state.progress_detail}
                 </motion.div>
               )}
-              {state.status === 'done' && current < STEPS.length - 2 && (
+              {state.status === 'done' && current < STEPS.length - 1 && (
                 <Button onClick={() => setCurrent(current + 1)}
                   style={{ background: '#1c2128', borderColor: '#30363d', color: '#e6edf3' }}>
                   下一步 →

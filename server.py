@@ -77,9 +77,17 @@ async def _warmup():
     import threading
     def _load():
         try:
-            print("[OCR·CHAIN] 正在预加载 PPStructureV3 主引擎，请稍候...")
-            from ocr_core import v3_pool
+            print("[OCR·CHAIN] 正在预加载引擎，请稍候...")
+            from ocr_core import v3_pool, fast_ocr_pool
+
+            # 预加载 PPStructureV3 主引擎（慢速模式）
+            print("[OCR·CHAIN] 正在预加载 PPStructureV3 主引擎...")
             v3_pool.warmup()
+
+            # 预加载纯 PaddleOCR 极速引擎（快速模式）
+            print("[OCR·CHAIN] 正在预加载纯 PaddleOCR 极速引擎...")
+            fast_ocr_pool.warmup()
+
             # 同时预热兼容引擎（后台）
             get_ocr_processor()
             print("[OCR·CHAIN] 引擎预加载指令已下发，后台加载中...")
@@ -621,6 +629,7 @@ async def ocr_pipeline(
     appid:          str  = Form(""),
     doc_type:       str  = Form("out"),        # 仅 material 任务使用
     export_format:  str  = Form("none"),       # none|excel|csv|markdown|all
+    mode:           str  = Form("slow"),       # slow|fast，控制引擎模式
 ):
     """
     统一 OCR 流水线接口（推荐主入口）。
@@ -636,8 +645,12 @@ async def ocr_pipeline(
       quotation    - 报价单
       general      - 通用版面分析
 
+    mode 取值：
+      slow  - 正常模式，使用 PPStructureV3（完整流程，生成表格）
+      fast  - 快速模式，使用纯 PaddleOCR（仅文本检测+识别）
+
     返回：{ success, task, fields, raw_text, table_html,
-             ocr_count, table_regions, summary, exports, timestamp }
+             ocr_count, table_regions, summary, exports, timestamp, mode }
     """
     from datetime import datetime as dt
     import sys
@@ -652,7 +665,7 @@ async def ocr_pipeline(
             print(f"[{ts}] [PipelineAPI] {msg}", flush=True)
         sys.stdout.flush()
     
-    _log(f'收到请求 task={task}, filename={file.filename}, export_format={export_format}')
+    _log(f'收到请求 task={task}, filename={file.filename}, export_format={export_format}, mode={mode}')
     tmp_path = _save_upload(file)
     _log(f'临时文件: {tmp_path}')
     # 创建独立会话目录，存放本次识别的所有文件
@@ -669,6 +682,7 @@ async def ocr_pipeline(
             fastgpt_config={"api_url": api_url, "api_key": api_key, "appid": appid} if use_fastgpt else None,
             doc_type=doc_type,
             output_dir=session_dir,
+            mode=mode,
         )
         elapsed = (dt.now() - t0).total_seconds()
         _log(f'✓ Pipeline 完成，耗时 {elapsed:.1f}s，文本块: {len(result.get("ocr_results", []))}')
@@ -808,6 +822,7 @@ async def ocr_pipeline(
             "ocr_count":     len(result.get("ocr_results", [])),
             "summary":       result.get("summary", ""),
             "exports":       exports,
+            "mode":          result.get("mode", "slow"),
             "timestamp":     result.get("timestamp",
                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         }
@@ -823,19 +838,19 @@ async def ocr_pipeline(
 async def ocr_repair_order(
     file: UploadFile = File(...),
     use_fastgpt: bool = Form(False),
-    fast_batch: bool = Form(False),
+    mode: str = Form("slow"),
     api_url:  str = Form(""),
     api_key:  str = Form(""),
     appid:    str = Form(""),
 ):
     """
     调修单 OCR 识别。
-    fast_batch=True：关闭表格结构识别、不落盘原表文件（JSON/HTML/表格xlsx），通常更快。
-    返回：{ success, fields, ocr_count, timestamp, raw_exports, fastgpt_used, fast_batch }
+    mode: slow|fast - 控制引擎模式
+    返回：{ success, fields, ocr_count, timestamp, raw_exports, fastgpt_used, mode }
     """
     from datetime import datetime as dt
     import sys
-    
+
     def _log(msg: str):
         ts = dt.now().strftime('%H:%M:%S.%f')[:-3]
         try:
@@ -845,9 +860,9 @@ async def ocr_repair_order(
                 msg = msg.replace(old, new)
             print(f"[{ts}] [调修单API] {msg}", flush=True)
         sys.stdout.flush()
-    
+
     _log(f'收到识别请求，文件名: {file.filename}')
-    _log(f'use_fastgpt={use_fastgpt}')
+    _log(f'use_fastgpt={use_fastgpt}, fast_batch={fast_batch}, mode={mode}')
     tmp_path = _save_upload(file)
     _log(f'临时文件已保存: {tmp_path}')
     session_dir = _create_session_dir()
@@ -864,61 +879,67 @@ async def ocr_repair_order(
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_cfg,
             output_dir=session_dir,
-            fast_batch=fast_batch,
+            mode=mode,
         )
-        elapsed = (dt.now() - t0).total_seconds()
-
-        # 记录字段提取来源
-        extracted_fields = result["extracted_fields"]
-        fastgpt_enabled = use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get('api_key'))
-        _log(f'✓ 识别完成，耗时 {elapsed:.1f}s')
-        _log(f'  - 文本块: {len(result["ocr_results"])} 个')
-        _log(f'  - FastGPT 启用: {fastgpt_enabled}')
-        _log(f'  - fast_batch: {fast_batch}')
-        _log(f'  - 提取字段: {extracted_fields}')
-
-        fields_list = _field_result(extracted_fields, result["ocr_results"])
-
-        # 构建原始表格文件路径（PPStructureV3 输出的 JSON/HTML/Excel）
-        base_name = os.path.splitext(os.path.basename(tmp_path))[0]
-        raw_json_path = os.path.join(session_dir, f"{base_name}.json")
-        raw_html_path = os.path.join(session_dir, f"{base_name}_table.html")
-        xlsx_raw = (result.get("xlsx_path") or "").strip()
-
-        return {
-            "success":   True,
-            "fields":    fields_list,
-            "ocr_count": len(result["ocr_results"]),
-            "timestamp": result["timestamp"],
-            # 原始表格文件路径
-            "raw_exports": {
-                "json": raw_json_path if os.path.exists(raw_json_path) else None,
-                "html": raw_html_path if os.path.exists(raw_html_path) else None,
-                "xlsx": xlsx_raw if xlsx_raw and os.path.exists(xlsx_raw) else None,
-            },
-            # 新增：FastGPT 使用标记，方便前端判断
-            "fastgpt_used": fastgpt_enabled,
-            "fast_batch":   fast_batch,
-        }
+        if result is None:
+            _log('✗ OCR 处理器返回 None')
+            raise ValueError('OCR 处理器返回空结果')
     except Exception as e:
         _log(f'✗ 识别失败: {e}')
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f'[调修单识别] {e}')
     finally:
         _cleanup(tmp_path)
+
+    elapsed = (dt.now() - t0).total_seconds()
+
+    # 记录字段提取来源
+    extracted_fields = result["extracted_fields"]
+    fastgpt_enabled = use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get('api_key'))
+    _log(f'✓ 识别完成，耗时 {elapsed:.1f}s')
+    _log(f'  - 文本块: {len(result["ocr_results"])} 个')
+    _log(f'  - FastGPT 启用: {fastgpt_enabled}')
+    _log(f'  - 模式: {mode}')
+    _log(f'  - 提取字段: {extracted_fields}')
+
+    fields_list = _field_result(extracted_fields, result["ocr_results"])
+
+    # 构建原始表格文件路径
+    base_name = os.path.splitext(os.path.basename(tmp_path))[0]
+    raw_json_path = os.path.join(session_dir, f"{base_name}.json")
+    raw_html_path = os.path.join(session_dir, f"{base_name}_table.html")
+    xlsx_raw = (result.get("xlsx_path") or "").strip()
+    xlsx_exists = bool(xlsx_raw and os.path.exists(xlsx_raw))
+
+    return {
+        "success":   True,
+        "fields":    fields_list,
+        "ocr_count": len(result["ocr_results"]),
+        "timestamp": result["timestamp"],
+        # 原始表格文件路径
+        "raw_exports": {
+            "json": raw_json_path if os.path.exists(raw_json_path) else None,
+            "html": raw_html_path if os.path.exists(raw_html_path) else None,
+            "xlsx": xlsx_raw if xlsx_exists else None,
+        },
+        "fastgpt_used": fastgpt_enabled,
+    }
 
 
 @app.post("/api/ocr/repair-order/batch")
 async def ocr_repair_order_batch(
     files: List[UploadFile] = File(...),
     use_fastgpt: bool = Form(False),
-    fast_batch: bool = Form(True),
+    mode: str = Form("slow"),
     api_url: str = Form(""),
     api_key: str = Form(""),
     appid: str = Form(""),
 ):
-    """调修单批量识别。默认 fast_batch=True（关闭表格结构重建与原表落盘，仅文本检测识别，速度更快）。"""
+    """调修单批量识别。
+
+    mode: slow|fast - 控制引擎模式
+    """
     from datetime import datetime as dt
 
     if not files:
@@ -936,7 +957,7 @@ async def ocr_repair_order_batch(
                 use_fastgpt=use_fastgpt,
                 fastgpt_config=fastgpt_cfg,
                 output_dir=session_dir,
-                fast_batch=fast_batch,
+                mode=mode,
             )
             extracted_fields = result["extracted_fields"]
             fields_list = _field_result(extracted_fields, result["ocr_results"])
@@ -946,6 +967,7 @@ async def ocr_repair_order_batch(
                 "fields": fields_list,
                 "ocr_count": len(result["ocr_results"]),
                 "timestamp": result["timestamp"],
+                "mode": result.get("mode", "slow"),
                 "fastgpt_used": use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get("api_key")),
                 "error": None,
             })
@@ -964,7 +986,7 @@ async def ocr_repair_order_batch(
             _cleanup(tmp_path)
     return {
         "success": all(x["success"] for x in out_list),
-        "fast_batch": fast_batch,
+        "mode": mode,
         "count": len(out_list),
         "results": out_list,
     }
@@ -1344,15 +1366,15 @@ async def export_repair_batch(
 async def ocr_repair_card(
     file: UploadFile = File(...),
     use_fastgpt: bool = Form(False),
-    fast_batch: bool = Form(False),
+    mode: str = Form("slow"),
     api_url:  str = Form(""),
     api_key:  str = Form(""),
     appid:    str = Form(""),
 ):
     """
     返修卡 OCR：PPStructureV3 版面/表格 + RepairCardParser 字段 + 可选 FastGPT。
-    fast_batch=True：关闭表格结构识别、不落盘原表文件。
-    返回：{ success, fields, ocr_count, timestamp, raw_exports, fastgpt_used, fast_batch }
+    mode: slow|fast - 控制引擎模式
+    返回：{ success, fields, ocr_count, timestamp, raw_exports, fastgpt_used, mode }
     """
     from datetime import datetime as dt
     import sys
@@ -1367,7 +1389,7 @@ async def ocr_repair_card(
             print(f"[{ts}] [返修卡API] {msg}", flush=True)
         sys.stdout.flush()
 
-    _log(f'收到识别请求，文件名: {file.filename}, use_fastgpt={use_fastgpt}')
+    _log(f'收到识别请求，文件名: {file.filename}, use_fastgpt={use_fastgpt}, mode={mode}')
     tmp_path = _save_upload(file)
     session_dir = _create_session_dir()
     _log(f'会话目录: {session_dir}')
@@ -1380,13 +1402,13 @@ async def ocr_repair_card(
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_cfg,
             output_dir=session_dir,
-            fast_batch=fast_batch,
+            mode=mode,
         )
         elapsed = (dt.now() - t0).total_seconds()
 
         extracted_fields = result["extracted_fields"]
         fastgpt_enabled = use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get('api_key'))
-        _log(f'✓ 识别完成，耗时 {elapsed:.1f}s，FastGPT={fastgpt_enabled}，fast_batch={fast_batch}，字段: {extracted_fields}')
+        _log(f'✓ 识别完成，耗时 {elapsed:.1f}s，FastGPT={fastgpt_enabled}，mode={result.get("mode","slow")}，字段: {extracted_fields}')
 
         fields_list = _field_result(extracted_fields, result["ocr_results"])
 
@@ -1394,6 +1416,7 @@ async def ocr_repair_card(
         raw_json_path = os.path.join(session_dir, f"{base_name}.json")
         raw_html_path = os.path.join(session_dir, f"{base_name}_table.html")
         xlsx_raw = (result.get("xlsx_path") or "").strip()
+        xlsx_exists = bool(xlsx_raw and os.path.exists(xlsx_raw))
 
         return {
             "success":   True,
@@ -1403,10 +1426,10 @@ async def ocr_repair_card(
             "raw_exports": {
                 "json": raw_json_path if os.path.exists(raw_json_path) else None,
                 "html": raw_html_path if os.path.exists(raw_html_path) else None,
-                "xlsx": xlsx_raw if xlsx_raw and os.path.exists(xlsx_raw) else None,
+                "xlsx": xlsx_raw if xlsx_exists else None,
             },
             "fastgpt_used": fastgpt_enabled,
-            "fast_batch":   fast_batch,
+            "mode":         result.get("mode", "slow"),
         }
     except Exception as e:
         _log(f'✗ 识别失败: {e}')
@@ -1420,12 +1443,15 @@ async def ocr_repair_card(
 async def ocr_repair_card_batch(
     files: List[UploadFile] = File(...),
     use_fastgpt: bool = Form(False),
-    fast_batch: bool = Form(True),
+    mode: str = Form("slow"),
     api_url: str = Form(""),
     api_key: str = Form(""),
     appid: str = Form(""),
 ):
-    """返修卡批量识别。默认 fast_batch=True（关闭表格结构重建与原表落盘，仅文本检测识别，速度更快）。"""
+    """返修卡批量识别。
+
+    mode: slow|fast - 控制引擎模式
+    """
     from datetime import datetime as dt
 
     if not files:
@@ -1443,7 +1469,7 @@ async def ocr_repair_card_batch(
                 use_fastgpt=use_fastgpt,
                 fastgpt_config=fastgpt_cfg,
                 output_dir=session_dir,
-                fast_batch=fast_batch,
+                mode=mode,
             )
             extracted_fields = result["extracted_fields"]
             fields_list = _field_result(extracted_fields, result["ocr_results"])
@@ -1453,6 +1479,7 @@ async def ocr_repair_card_batch(
                 "fields": fields_list,
                 "ocr_count": len(result["ocr_results"]),
                 "timestamp": result["timestamp"],
+                "mode": result.get("mode", "slow"),
                 "fastgpt_used": use_fastgpt and bool(fastgpt_cfg and fastgpt_cfg.get("api_key")),
                 "error": None,
             })
@@ -1471,7 +1498,7 @@ async def ocr_repair_card_batch(
             _cleanup(tmp_path)
     return {
         "success": all(x["success"] for x in out_list),
-        "fast_batch": fast_batch,
+        "mode": mode,
         "count": len(out_list),
         "results": out_list,
     }
@@ -1756,11 +1783,14 @@ async def export_download(filename: str):
     import mimetypes
     media_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
 
-    return FileResponse(
-        path=file_path,
-        filename=safe_name,
-        media_type=media_type,
-    )
+    try:
+        return FileResponse(
+            path=file_path,
+            filename=safe_name,
+            media_type=media_type,
+        )
+    except RuntimeError:
+        raise HTTPException(status_code=404, detail=f"文件不存在或已被清理: {safe_name}")
 
 
 @app.get("/api/export/list")

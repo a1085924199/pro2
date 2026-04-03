@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ocr_core.py - OCR 核心处理模块 v7.0
+ocr_core.py - OCR 核心处理模块 v8.0
 
 架构：
-  PPStructureV3Pool      - 主引擎池（PPStructureV3），项目启动时预加载
-                           负责：文本识别、版面分析、表格结构识别
-  OCRTask                - 任务类型枚举
-  OCRPipeline            - 统一流水线，按任务类型分发处理
-  DocParser              - 单据解析器基类
-  RepairOrderParser      - 调修单专用解析器
-  RepairCardParser       - 返修卡专用解析器
-  MaterialParser         - 航材出入库单专用解析器
+  PPStructureV3Pool    - 主引擎池（PP-Structure），项目启动时预加载
+                        负责：文本识别、版面分析、表格结构识别（慢速模式）
+  PaddleOCREnginePool  - 极速引擎池（纯 PaddleOCR），仅加载 det/rec 模型
+                        负责：快速文本检测+识别，不做版面分析/表格识别（快速模式）
+  OCRTask              - 任务类型枚举
+  OCRPipeline          - 统一流水线，按任务类型分发处理
+  DocParser            - 单据解析器基类
+  RepairOrderParser    - 调修单专用解析器
+  RepairCardParser     - 返修卡专用解析器
+  MaterialParser       - 航材出入库单专用解析器
+
+双引擎路由：
+  - slow 模式（默认）：使用 PPStructureV3，走完整流程（版面分析+OCR+表格识别）
+  - fast 模式（快速模式/批量模式强制）：使用纯 PaddleOCR，仅文本检测+识别，不生成表格
 """
 import os
 import sys
@@ -42,10 +48,12 @@ def _log(msg: str, flush: bool = True):
 os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
 
 try:
-    from paddleocr import PPStructureV3
+    from paddleocr import PPStructureV3, PaddleOCR
     _PP_STRUCTURE_V3_AVAILABLE = True
+    _PADDLE_OCR_AVAILABLE = True
 except ImportError:
     _PP_STRUCTURE_V3_AVAILABLE = False
+    _PADDLE_OCR_AVAILABLE = False
 
 # 任务类型枚举
 from enum import Enum
@@ -188,6 +196,119 @@ class PPStructureV3Pool:
 
 # PPStructureV3 全局主引擎单例
 v3_pool = PPStructureV3Pool()
+
+
+# ============================================================================
+# 纯 PaddleOCR 极速引擎池（快速模式专用）
+# ============================================================================
+class PaddleOCREnginePool:
+    """
+    纯 PaddleOCR 引擎单例，仅加载检测+识别模型，不加载 layout/table 模型。
+    用于快速模式（fast_batch），跳过表格结构识别，只做文本检测+识别。
+
+    特点：
+    - 轻量级，仅需要 det_model_dir 和 rec_model_dir
+    - 无版面分析、无表格识别，速度更快
+    - 线程安全，双重检查锁定模式
+    """
+    _instance: Optional['PaddleOCREnginePool'] = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._engine = None
+                    cls._instance._ready = False
+                    cls._instance._init_lock = threading.Lock()
+                    cls._instance._warmup_done = False
+                    cls._instance._init_failed = False
+        return cls._instance
+
+    def _init(self):
+        """初始化纯 PaddleOCR 引擎（幂等）"""
+        with self._init_lock:
+            if self._ready:
+                return
+            if self._init_failed:
+                raise RuntimeError('PaddleOCR 引擎初始化已失败，跳过重试')
+            if not _PADDLE_OCR_AVAILABLE:
+                print('[FastOCR] PaddleOCR 不可用，请升级 paddleocr')
+                self._init_failed = True
+                raise RuntimeError('PaddleOCR 不可用，请执行: pip install -U paddleocr')
+            try:
+                print('[FastOCR] 正在初始化纯 PaddleOCR 极速引擎...', flush=True)
+                import paddle
+                _log('[FastOCR] PaddlePaddle 已加载')
+                _log('[FastOCR] 正在配置推理设备...')
+
+                device = 'cpu'
+                try:
+                    paddle.device.set_device('gpu')
+                    device = 'gpu'
+                    _log('[FastOCR] 检测到 GPU，将使用 GPU 加速推理')
+                except Exception as e:
+                    _log(f'[FastOCR] GPU 不可用，将使用 CPU 推理: {e}')
+
+                _log('[FastOCR] 正在加载 PP-OCRv5 检测模型...')
+                _log('[FastOCR] 正在加载 PP-OCRv5 识别模型...')
+                t0 = time.time()
+                self._engine = PaddleOCR(
+                    det_model_dir=DET_MODEL_DIR,
+                    rec_model_dir=REC_MODEL_DIR,
+                    use_angle_cls=False,          # 关闭角度分类
+                    rec_batch_num=16,            # 批量识别
+                )
+                _log(f'[FastOCR] ✓ 引擎初始化完成，耗时 {time.time()-t0:.1f}s')
+                self._ready = True
+                print('[FastOCR] 纯 PaddleOCR 极速引擎启动成功', flush=True)
+            except Exception as e:
+                _log(f'[FastOCR] ✗ 引擎初始化失败: {e}')
+                self._engine = None
+                self._ready = False
+                self._init_failed = True
+                raise
+
+    def get(self):
+        """获取引擎（按需同步初始化）。引擎不可用时返回 None。"""
+        if not self._ready:
+            self._init()
+        return self._engine
+
+    @property
+    def available(self) -> bool:
+        """引擎是否可用（初始化成功且引擎实例非空）"""
+        return self._ready and self._engine is not None and not getattr(self, '_init_failed', False)
+
+    def warmup(self):
+        """后台线程预热，供服务 startup 事件调用"""
+        def _load():
+            try:
+                self._init()
+                if self._ready and self._engine:
+                    import cv2
+                    import numpy as np
+                    test_img = np.zeros((100, 100, 3), dtype=np.uint8)
+                    cv2.putText(test_img, 'test', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    list(self._engine.ocr(test_img))
+                    self._warmup_done = True
+                    _log('[FastOCR] ✓ 引擎预热完成，模型已就绪')
+            except Exception as e:
+                _log(f'[FastOCR] ⚠ 预加载失败（不影响服务运行）: {e}')
+        threading.Thread(target=_load, daemon=True).start()
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    @property
+    def warmup_done(self) -> bool:
+        return getattr(self, '_warmup_done', False)
+
+
+# 纯 PaddleOCR 极速引擎全局单例
+fast_ocr_pool = PaddleOCREnginePool()
 
 
 # ============================================================================
@@ -538,23 +659,106 @@ class DocParser:
                                     'fields_def': json.dumps([{'field': f} for f in self.FIELDS], ensure_ascii=False)},
                       'messages': [{'role': 'user', 'content': prompt}]},
                 timeout=30)
+            _log(f'[_extract_fastgpt] FastGPT 响应状态码: {resp.status_code}')
             if resp.status_code == 200:
-                content = resp.json().get('choices',[{}])[0].get('message',{}).get('content','')
-                m = re.search(r'\{[\s\S]*\}', content, re.DOTALL)
-                if m:
-                    result = {f: '' for f in self.FIELDS}
-                    try:
-                        parsed = json.loads(m.group())
-                        if isinstance(parsed, dict):
-                            for fn, val in parsed.items():
-                                if fn in result: result[fn] = str(val) if val else ''
-                        elif isinstance(parsed, list):
-                            for item in parsed:
-                                fn = item.get('field', '')
-                                if fn in result: result[fn] = item.get('value', '')
-                    except json.JSONDecodeError:
-                        pass
+                resp_data = resp.json()
+                _log(f'[_extract_fastgpt] FastGPT 响应原始数据: {json.dumps(resp_data, ensure_ascii=False)[:500]}')
+                
+                # 提取 content（可能嵌套在 choices 中）
+                content = ''
+                if isinstance(resp_data, dict):
+                    content = resp_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    if not content:
+                        # 尝试直接从响应中获取 JSON
+                        for key in ['data', 'result', 'response']:
+                            if key in resp_data:
+                                val = resp_data[key]
+                                if isinstance(val, dict):
+                                    content = val.get('content', val.get('text', str(val)))
+                                elif isinstance(val, str):
+                                    content = val
+                                break
+                
+                _log(f'[_extract_fastgpt] 提取的 content: {content[:300] if content else "(空)"}')
+                
+                if not content:
+                    _log(f'[_extract_fastgpt] 警告: FastGPT 返回的 content 为空，使用原始 OCR 识别结果')
+                    return self.extract_fields(texts, table_regions)
+                
+                # 清理 content：去除代码块标记
+                clean_content = content.strip()
+                if clean_content.startswith('```'):
+                    # 去除 ```json 或 ``` 等标记
+                    lines = clean_content.split('\n')
+                    if lines[0].startswith('```'):
+                        lines = lines[1:]
+                    if lines and lines[-1].startswith('```'):
+                        lines = lines[:-1]
+                    clean_content = '\n'.join(lines).strip()
+                
+                # 尝试多层解析：先尝试直接解析，然后尝试解析嵌套的 JSON
+                result = {f: '' for f in self.FIELDS}
+                parsed = None
+                
+                # 方法1：直接解析
+                try:
+                    parsed = json.loads(clean_content)
+                    _log(f'[_extract_fastgpt] 方法1成功：直接解析 JSON')
+                except json.JSONDecodeError:
+                    # 方法2：尝试从 content 中提取 JSON 对象
+                    m = re.search(r'\{[\s\S]*\}', clean_content, re.DOTALL)
+                    if m:
+                        try:
+                            parsed = json.loads(m.group())
+                            _log(f'[_extract_fastgpt] 方法2成功：从文本中提取并解析 JSON')
+                        except json.JSONDecodeError:
+                            _log(f'[_extract_fastgpt] 方法2失败')
+                    else:
+                        _log(f'[_extract_fastgpt] 方法2失败：未找到 JSON 对象')
+                
+                # 方法3：如果 parsed 是字符串，尝试再次解析（处理嵌套 JSON）
+                if parsed is not None:
+                    if isinstance(parsed, str):
+                        # content 本身可能是 JSON 字符串，需要再次解析
+                        try:
+                            parsed = json.loads(parsed)
+                            _log(f'[_extract_fastgpt] 方法3成功：解析嵌套 JSON 字符串')
+                        except json.JSONDecodeError:
+                            m2 = re.search(r'\{[\s\S]*\}', parsed, re.DOTALL)
+                            if m2:
+                                try:
+                                    parsed = json.loads(m2.group())
+                                    _log(f'[_extract_fastgpt] 方法3成功：从嵌套字符串中提取并解析 JSON')
+                                except json.JSONDecodeError:
+                                    _log(f'[_extract_fastgpt] 方法3失败')
+                                    parsed = None
+                            else:
+                                _log(f'[_extract_fastgpt] 方法3失败：未找到 JSON 对象')
+                    elif isinstance(parsed, dict):
+                        # 检查是否需要从嵌套结构中提取
+                        if 'data' in parsed and isinstance(parsed['data'], str):
+                            try:
+                                parsed = json.loads(parsed['data'])
+                                _log(f'[_extract_fastgpt] 方法3成功：从 data 字段解析嵌套 JSON')
+                            except json.JSONDecodeError:
+                                pass
+                
+                # 应用解析结果
+                if parsed and isinstance(parsed, dict):
+                    for fn, val in parsed.items():
+                        if fn in result:
+                            result[fn] = str(val) if val else ''
+                    _log(f'[_extract_fastgpt] 成功解析 FastGPT 结果: {result}')
                     return result
+                elif parsed and isinstance(parsed, list):
+                    for item in parsed:
+                        fn = item.get('field', '')
+                        if fn in result:
+                            result[fn] = item.get('value', '')
+                    _log(f'[_extract_fastgpt] 成功解析 FastGPT 结果（列表格式）: {result}')
+                    return result
+                else:
+                    _log(f'[_extract_fastgpt] 无法解析 FastGPT 响应，使用原始 OCR 识别结果')
         except Exception as e:
             print(f'FastGPT调用失败({self.__class__.__name__}): {e}')
         # 超时或解析失败时回退到规则提取（传入完整 OCR 文本供匹配）
@@ -1060,8 +1264,247 @@ class MaterialParser(DocParser):
 # ============================================================================
 class OCRPipeline:
     """
-    统一 OCR 流水线，按任务类型分发处理。
+    统一 OCR 流水线，支持双引擎路由：
+    - slow 模式（默认）：使用 PPStructureV3，走完整流程（版面分析+OCR+表格识别）
+    - fast 模式：使用纯 PaddleOCR，仅文本检测+识别，不生成表格
+
+    批量模式（fast_batch=True）强制使用 fast 模式。
     """
+    @staticmethod
+    def _process_fast(image_path: str, output_dir: str, use_fastgpt: bool = False,
+                      fastgpt_config: dict = None, task_type: OCRTask = OCRTask.GENERAL,
+                      **kwargs) -> Dict:
+        """
+        快速模式处理：使用纯 PaddleOCR 引擎，仅做文本检测+识别。
+
+        参数:
+            image_path: 图像文件路径
+            output_dir: 输出目录
+            use_fastgpt: 是否使用 FastGPT 增强字段提取
+            fastgpt_config: FastGPT 配置
+            task_type: 任务类型
+            **kwargs: 额外参数
+
+        返回: 统一格式结果字典
+        """
+        t_start = time.time()
+        _log(f'[OCRPipeline/FAST] ========== 快速模式开始处理 ==========')
+        _log(f'[OCRPipeline/FAST] 输入文件: {image_path}')
+        _log(f'[OCRPipeline/FAST] 任务类型: {task_type.value}')
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 获取纯 PaddleOCR 引擎
+        _log(f'[OCRPipeline/FAST] 正在获取纯 PaddleOCR 极速引擎...')
+        engine = fast_ocr_pool.get()
+        if engine is None:
+            raise RuntimeError('纯 PaddleOCR 引擎不可用')
+
+        # 预处理图像
+        _log(f'[OCRPipeline/FAST] 正在进行图像预处理...')
+        img_bgr = preprocess_image(image_path)
+        h, w = img_bgr.shape[:2]
+        _log(f'[OCRPipeline/FAST] 预处理完成，图像尺寸: {w}x{h}')
+
+        # 执行纯文本检测+识别
+        _log(f'[OCRPipeline/FAST] >>> 正在执行纯文本检测+识别...')
+        t0 = time.time()
+        sys.stdout.flush()
+
+        try:
+            ocr_results_raw = engine.ocr(img_bgr)
+        except Exception as e:
+            _log(f'[OCRPipeline/FAST] ✗ OCR 失败: {e}')
+            raise
+
+        t_det_rec = time.time() - t0
+        _log(f'[OCRPipeline/FAST] ✓ 文本检测+识别完成，耗时 {t_det_rec:.1f}s')
+
+        # 转换结果格式
+        _log(f'[OCRPipeline/FAST] >>> 正在转换 OCR 结果格式...')
+        ocr_results: List[Dict] = []
+
+        def _poly_to_bbox_and_flat(poly_obj) -> tuple:
+            """从四边形点集得到 [x1,y1,x2,y2] 与扁平 poly 列表（兼容 ndarray / list）。"""
+            if poly_obj is None:
+                return [], []
+            pts = np.asarray(poly_obj, dtype=np.float64)
+            if pts.size == 0:
+                return [], []
+            if pts.ndim == 1 and len(pts) >= 4:
+                xs = [float(pts[i]) for i in range(0, min(len(pts), 8), 2)]
+                ys = [float(pts[i]) for i in range(1, min(len(pts), 8), 2)]
+                flat = [float(x) for x in pts.tolist()] if hasattr(pts, 'tolist') else list(pts)
+            else:
+                flat = pts.reshape(-1).tolist()
+                xs = [float(p[0]) for p in pts.reshape(-1, 2)]
+                ys = [float(p[1]) for p in pts.reshape(-1, 2)]
+            if not xs or not ys:
+                return [], flat
+            return [min(xs), min(ys), max(xs), max(ys)], flat
+
+        def _page_seq(val, alt_key=None, page_dict=None):
+            """从 page dict 取值；禁止对 ndarray 使用 `or`，否则触发真值歧义。"""
+            if val is not None:
+                return val
+            if alt_key is not None and page_dict is not None:
+                v2 = page_dict.get(alt_key)
+                if v2 is not None:
+                    return v2
+            return []
+
+        if ocr_results_raw and isinstance(ocr_results_raw, list) and len(ocr_results_raw) > 0:
+            first_item = ocr_results_raw[0]
+            if isinstance(first_item, dict):
+                # PaddleOCR 3.x pipeline：每页一个 dict，含 rec_texts + rec_scores + dt_polys/rec_polys
+                total_lines = 0
+                for page in ocr_results_raw:
+                    if not isinstance(page, dict):
+                        continue
+                    rec_texts = page.get('rec_texts')
+                    if rec_texts is None:
+                        rec_texts = []
+                    elif isinstance(rec_texts, np.ndarray):
+                        rec_texts = rec_texts.tolist()
+                    rec_scores = page.get('rec_scores')
+                    if rec_scores is None:
+                        rec_scores = []
+                    elif isinstance(rec_scores, np.ndarray):
+                        rec_scores = rec_scores.astype(float).tolist()
+                    rec_res = page.get('rec_res')
+                    if rec_res is None:
+                        rec_res = []
+                    polys_src = _page_seq(page.get('rec_polys'), 'dt_polys', page)
+                    if polys_src is None:
+                        polys_src = []
+                    rec_boxes = page.get('rec_boxes')
+                    if rec_boxes is None:
+                        rec_boxes = []
+
+                    if len(rec_texts) > 0:
+                        for idx, text in enumerate(rec_texts):
+                            confidence = float(rec_scores[idx]) if idx < len(rec_scores) else 0.0
+                            bbox, poly = [], []
+                            if idx < len(polys_src):
+                                bbox, poly = _poly_to_bbox_and_flat(polys_src[idx])
+                            elif idx < len(rec_boxes) and rec_boxes[idx] is not None:
+                                box = np.asarray(rec_boxes[idx]).reshape(-1)
+                                if len(box) >= 4:
+                                    bbox = [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
+                                    poly = bbox[:]
+                            ocr_results.append({
+                                'text': str(text),
+                                'confidence': round(confidence, 4),
+                                'bbox': bbox,
+                                'poly': poly,
+                                'type': 'text',
+                            })
+                        total_lines += len(rec_texts)
+                    elif len(rec_res) > 0:
+                        dt_polys = page.get('dt_polys', [])
+                        for idx, text_info in enumerate(rec_res):
+                            if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
+                                text = text_info[0]
+                                confidence = float(text_info[1])
+                            else:
+                                text = str(text_info)
+                                confidence = 0.0
+                            bbox, poly = [], []
+                            if idx < len(dt_polys):
+                                bbox, poly = _poly_to_bbox_and_flat(dt_polys[idx])
+                            ocr_results.append({
+                                'text': str(text),
+                                'confidence': round(confidence, 4),
+                                'bbox': bbox,
+                                'poly': poly,
+                                'type': 'text',
+                            })
+                        total_lines += len(rec_res)
+                if total_lines:
+                    _log(f'[OCRPipeline/FAST]   新版 dict 结果: 共 {total_lines} 条文本行')
+            else:
+                # 兼容旧版 list 格式
+                for line_result in ocr_results_raw:
+                    if line_result and isinstance(line_result, list):
+                        for item in line_result:
+                            if item and len(item) >= 2:
+                                bbox_info = item[0]
+                                text_info = item[1]
+                                if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
+                                    text = text_info[0]
+                                    confidence = float(text_info[1])
+                                else:
+                                    text = str(text_info)
+                                    confidence = 0.0
+                                poly = []
+                                if bbox_info and isinstance(bbox_info, list):
+                                    poly = [float(p) for sublist in bbox_info for p in sublist]
+                                bbox = []
+                                if bbox_info and isinstance(bbox_info, list) and len(bbox_info) >= 4:
+                                    xs = [p[0] for p in bbox_info]
+                                    ys = [p[1] for p in bbox_info]
+                                    bbox = [min(xs), min(ys), max(xs), max(ys)]
+                                ocr_results.append({
+                                    'text': str(text),
+                                    'confidence': round(confidence, 4),
+                                    'bbox': bbox,
+                                    'poly': poly,
+                                    'type': 'text',
+                                })
+
+        _log(f'[OCRPipeline/FAST] 转换完成，识别到 {len(ocr_results)} 个文本块')
+
+        # 快速模式不生成表格结构，使用几何推断
+        table = {
+            'table_idx': 0,
+            'html': '',
+            'cells': [],
+            'bbox': [],
+            'num_rows': 0,
+            'num_cols': 0,
+        }
+
+        # 根据任务类型选择解析器并提取字段
+        _log(f'[OCRPipeline/FAST] >>> 正在提取字段信息...')
+        extracted_fields: Dict[str, str] = {}
+        if task_type != OCRTask.GENERAL:
+            parser_map = {
+                OCRTask.REPAIR_ORDER: RepairOrderParser(),
+                OCRTask.REPAIR_CARD: RepairCardParser(),
+                OCRTask.MATERIAL: MaterialParser(kwargs.get('doc_type', 'out')),
+            }
+            parser = parser_map.get(task_type, DocParser())
+
+            if use_fastgpt and fastgpt_config and fastgpt_config.get('api_key'):
+                _log(f'[OCRPipeline/FAST]   正在使用 FastGPT 增强字段提取...')
+                extracted_fields = parser._extract_fastgpt(ocr_results, fastgpt_config, None)
+            else:
+                extracted_fields = parser.extract_fields(ocr_results, None)
+            _log(f'[OCRPipeline/FAST]   字段提取完成: {extracted_fields}')
+
+        # 构建返回结果
+        result = {
+            'success': True,
+            'image_path': image_path,
+            'image_name': os.path.basename(image_path),
+            'ocr_results': ocr_results,
+            'table_regions': [],  # 快速模式不生成表格区域
+            'table': table,
+            'extracted_fields': extracted_fields,
+            'summary': f'快速模式：共识别 {len(ocr_results)} 个文本块（不生成表格结构）',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'xlsx_path': '',       # 快速模式不生成 Excel
+            'mode': 'fast',        # 标记为快速模式
+            'skip_structure_artifacts': True,
+        }
+
+        total_time = time.time() - t_start
+        _log(f'')
+        _log(f'[SUCCESS] ✓ 快速模式识别完成！总计耗时 {total_time:.1f}s')
+        _log(f'[OCRPipeline/FAST] ========== 处理结束 ==========')
+
+        return result
+
     @staticmethod
     def process(image_path: str, task_type: OCRTask = OCRTask.GENERAL, **kwargs) -> Dict:
         """
@@ -1074,23 +1517,34 @@ class OCRPipeline:
                 - use_fastgpt: 是否使用 FastGPT 优化
                 - fastgpt_config: FastGPT 配置
                 - output_dir: 输出目录
-                - fast_batch: 为 True 时关闭表格结构识别（predict 使用 use_table_recognition=False），
-                  仅跑文本检测+识别，通常更快；表格区域依赖几何推断 build_table_structure。
-                - skip_structure_artifacts: 为 True 时不落盘 JSON/MD/HTML/原表 xlsx 及最终解析 json（批量场景）。
-                  未指定时若 fast_batch=True 则默认跳过。
+                - mode: 'slow' | 'fast'，指定使用哪个引擎模式。
+                  - 'slow': 使用 PPStructureV3（完整流程）
+                  - 'fast': 使用纯 PaddleOCR（仅文本识别）
         """
         t_start = time.time()
-        fast_batch = bool(kwargs.get('fast_batch', False))
-        skip_artifacts = kwargs.get('skip_structure_artifacts')
-        if skip_artifacts is None:
-            skip_artifacts = fast_batch
-        skip_artifacts = bool(skip_artifacts)
+        mode = kwargs.get('mode', 'slow')  # 'slow', 'fast'
 
+        # 确定使用哪个引擎
+        use_fast_engine = (mode == 'fast')
+
+        # 快速模式：使用纯 PaddleOCR 引擎
+        if use_fast_engine:
+            _known_keys = {'use_fastgpt', 'fastgpt_config', 'output_dir'}
+            _filtered = {k: v for k, v in kwargs.items() if k not in _known_keys}
+            return OCRPipeline._process_fast(
+                image_path=image_path,
+                output_dir=kwargs.get('output_dir', 'output'),
+                use_fastgpt=bool(kwargs.get('use_fastgpt', False)),
+                fastgpt_config=kwargs.get('fastgpt_config'),
+                task_type=task_type,
+                **_filtered
+            )
+
+        # 正常模式：使用 PPStructureV3 完整流程
         _log(f'[OCRPipeline] ========== 开始处理 ==========')
         _log(f'[OCRPipeline] 任务类型: {task_type.value}')
         _log(f'[OCRPipeline] 输入文件: {image_path}')
-        if fast_batch:
-            _log(f'[OCRPipeline] 快速模式: fast_batch=True（关闭表格结构识别，原表文件不落盘={skip_artifacts}）')
+        _log(f'[OCRPipeline] 引擎模式: 正常模式（PP-StructureV3）')
         
         output_dir = kwargs.get('output_dir', 'output')
         os.makedirs(output_dir, exist_ok=True)
@@ -1122,13 +1576,7 @@ class OCRPipeline:
         _log(f'[OCRPipeline]   - 正在调用 engine.predict()...')
         t0 = time.time()
         sys.stdout.flush()
-        if fast_batch:
-            try:
-                results = list(engine.predict(img_bgr, use_table_recognition=False))
-            except TypeError:
-                results = list(engine.predict(img_bgr))
-        else:
-            results = list(engine.predict(img_bgr))
+        results = list(engine.predict(img_bgr))
         t_det_rec = time.time() - t0
         _log(f'[OCRPipeline]   - 文本检测+识别完成，耗时 {t_det_rec:.1f}s')
         
@@ -1144,18 +1592,15 @@ class OCRPipeline:
         t_ocr = time.time() - t_stage
         _log(f'[OCRPipeline] ✓ 阶段 1/5 完成，总耗时 {t_ocr:.1f}s（检测+识别: {t_det_rec:.1f}s，表格解析: {t_html:.1f}s），返回 {len(results)} 个结果')
 
-        # 保存结果文件（批量快速模式跳过，避免原表输出与 IO 开销）
-        if skip_artifacts:
-            _log(f'[OCRPipeline] >>> 阶段 2/5: 已跳过原表 JSON/MD/HTML/XLSX 落盘（快速批量）')
-        else:
-            _log(f'[OCRPipeline] >>> 阶段 2/5: 正在保存识别结果文件（JSON/MD/HTML/Excel）...')
-            t0 = time.time()
-            for res in results:
-                res.save_to_json(save_path=json_path)
-                res.save_to_markdown(save_path=md_path)
-                res.save_to_html(save_path=html_path)
-                res.save_to_xlsx(save_path=xlsx_path)
-            _log(f'[OCRPipeline] ✓ 阶段 2/5 完成，耗时 {time.time()-t0:.1f}s')
+        # 保存结果文件
+        _log(f'[OCRPipeline] >>> 阶段 2/5: 正在保存识别结果文件（JSON/MD/HTML/Excel）...')
+        t0 = time.time()
+        for res in results:
+            res.save_to_json(save_path=json_path)
+            res.save_to_markdown(save_path=md_path)
+            res.save_to_html(save_path=html_path)
+            res.save_to_xlsx(save_path=xlsx_path)
+        _log(f'[OCRPipeline] ✓ 阶段 2/5 完成，耗时 {time.time()-t0:.1f}s')
 
         # 解析结果获取文本和表格数据
         _log(f'[OCRPipeline] >>> 阶段 3/5: 正在解析推理结果...')
@@ -1242,28 +1687,23 @@ class OCRPipeline:
             'extracted_fields': extracted_fields,
             'summary': f'共识别 {len(ocr_results)} 个文本块，{len(table_regions)} 个表格区域',
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'xlsx_path': '' if skip_artifacts else xlsx_path,
-            'fast_batch': fast_batch,
-            'skip_structure_artifacts': skip_artifacts,
+            'xlsx_path': xlsx_path,
+            'mode': 'slow',
         }
 
         # 保存解析结果（包含提取的字段信息）
-        if skip_artifacts:
-            _log(f'[OCRPipeline] 已跳过最终 JSON 落盘（快速批量）')
-        else:
-            _log(f'[OCRPipeline] 正在保存最终 JSON 结果...')
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
+        _log(f'[OCRPipeline] 正在保存最终 JSON 结果...')
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
 
         total_time = time.time() - t_start
         _log(f'')
         _log(f'[SUCCESS] ✓ 识别完成！总计耗时 {total_time:.1f}s')
-        if not skip_artifacts:
-            _log(f'[INFO] 生成的文件：')
-            _log(f'  - {os.path.basename(json_path)} (完整识别结果)')
-            _log(f'  - {os.path.basename(md_path)} (Markdown结果)')
-            _log(f'  - {os.path.basename(html_path)} (表格HTML)')
-            _log(f'  - {os.path.basename(xlsx_path)} (表格Excel)')
+        _log(f'[INFO] 生成的文件：')
+        _log(f'  - {os.path.basename(json_path)} (完整识别结果)')
+        _log(f'  - {os.path.basename(md_path)} (Markdown结果)')
+        _log(f'  - {os.path.basename(html_path)} (表格HTML)')
+        _log(f'  - {os.path.basename(xlsx_path)} (表格Excel)')
         _log(f'[OCRPipeline] ========== 处理结束 ==========')
 
         return result
@@ -1295,9 +1735,16 @@ class RepairOrderOCR:
     def __init__(self):
         pass
 
-    def process_image(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None, fast_batch: bool = False) -> Dict:
+    def process_image(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None, mode: str = "slow") -> Dict:
         """
         处理调修单图像
+
+        参数:
+            image_path: 图像文件路径
+            use_fastgpt: 是否使用 FastGPT 增强
+            fastgpt_config: FastGPT 配置
+            output_dir: 输出目录
+            mode: slow|fast - 控制引擎模式
         """
         return OCRPipeline.process(
             image_path,
@@ -1305,11 +1752,10 @@ class RepairOrderOCR:
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_config,
             output_dir=output_dir or 'output',
-            fast_batch=fast_batch,
-            skip_structure_artifacts=fast_batch,
+            mode=mode,
         )
 
-    def process_repair_card(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None, fast_batch: bool = False) -> Dict:
+    def process_repair_card(self, image_path: str, use_fastgpt: bool = False, fastgpt_config: dict = None, output_dir: str = None, mode: str = "slow") -> Dict:
         """处理返修卡图像（PPStructureV3 + RepairCardParser 字段 + 可选 FastGPT）"""
         from ocr_core import OCRPipeline, OCRTask
         return OCRPipeline.process(
@@ -1318,8 +1764,7 @@ class RepairOrderOCR:
             use_fastgpt=use_fastgpt,
             fastgpt_config=fastgpt_config,
             output_dir=output_dir or 'output',
-            fast_batch=fast_batch,
-            skip_structure_artifacts=fast_batch,
+            mode=mode,
         )
 
     def ocr_recognize(self, image_path: str, output_dir: str = None) -> List[Dict]:

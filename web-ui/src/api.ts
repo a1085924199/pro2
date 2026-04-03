@@ -46,6 +46,8 @@ export interface OcrResponse {
   }
   /** FastGPT 是否被用于增强识别 */
   fastgpt_used?: boolean
+  /** 引擎模式: 'slow' | 'fast' */
+  mode?: 'slow' | 'fast'
 }
 
 // ─── 健康检查 ────────────────────────────────────────────────
@@ -57,12 +59,13 @@ export async function checkHealth(): Promise<{ status: string }> {
 // ─── 调修单 OCR ──────────────────────────────────────────────
 export async function ocrRepairOrder(
   file: File,
-  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string; fastBatch?: boolean },
+  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string; fastBatch?: boolean; mode?: 'slow' | 'fast' },
 ): Promise<OcrResponse & { fast_batch?: boolean }> {
   const form = new FormData()
   form.append('file', file)
   form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
   form.append('fast_batch', String(opts?.fastBatch ?? false))
+  form.append('mode', opts?.mode ?? 'slow')
   form.append('api_url',  opts?.apiUrl  ?? '')
   form.append('api_key',  opts?.apiKey  ?? '')
   form.append('appid',    opts?.appid   ?? '')
@@ -73,15 +76,16 @@ export async function ocrRepairOrder(
 /** 调修单批量识别 */
 export async function ocrRepairOrderBatch(
   files: File[],
-  opts?: { useFastgpt?: boolean; fastBatch?: boolean; apiUrl?: string; apiKey?: string; appid?: string },
+  opts?: { useFastgpt?: boolean; fastBatch?: boolean; mode?: 'slow' | 'fast'; apiUrl?: string; apiKey?: string; appid?: string },
 ): Promise<{
-  success: boolean; fast_batch: boolean; count: number
-  results: Array<{ success: boolean; filename: string; fields: FieldResult[]; ocr_count: number; timestamp: string; fastgpt_used: boolean; error: string | null }>
+  success: boolean; fast_batch: boolean; mode: string; count: number
+  results: Array<{ success: boolean; filename: string; fields: FieldResult[]; ocr_count: number; timestamp: string; mode?: string; fastgpt_used: boolean; error: string | null }>
 }> {
   const form = new FormData()
   for (const f of files) form.append('files', f)
   form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
-  form.append('fast_batch', String(opts?.fastBatch ?? true))
+  form.append('fast_batch', String(opts?.fastBatch ?? false))
+  form.append('mode', opts?.mode ?? 'slow')
   form.append('api_url',  opts?.apiUrl  ?? '')
   form.append('api_key',  opts?.apiKey  ?? '')
   form.append('appid',    opts?.appid   ?? '')
@@ -163,12 +167,13 @@ export async function saveFastgptConfig(cfg: FastgptConfig): Promise<{ success: 
 // ─── 返修卡 OCR ──────────────────────────────────────────────
 export async function ocrRepairCard(
   file: File,
-  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string; fastBatch?: boolean },
+  opts?: { useFastgpt?: boolean; apiUrl?: string; apiKey?: string; appid?: string; fastBatch?: boolean; mode?: 'slow' | 'fast' },
 ): Promise<OcrResponse & { fast_batch?: boolean }> {
   const form = new FormData()
   form.append('file', file)
   form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
   form.append('fast_batch', String(opts?.fastBatch ?? false))
+  form.append('mode', opts?.mode ?? 'slow')
   form.append('api_url',  opts?.apiUrl  ?? '')
   form.append('api_key',  opts?.apiKey  ?? '')
   form.append('appid',    opts?.appid   ?? '')
@@ -179,15 +184,16 @@ export async function ocrRepairCard(
 /** 返修卡批量识别 */
 export async function ocrRepairCardBatch(
   files: File[],
-  opts?: { useFastgpt?: boolean; fastBatch?: boolean; apiUrl?: string; apiKey?: string; appid?: string },
+  opts?: { useFastgpt?: boolean; fastBatch?: boolean; mode?: 'slow' | 'fast'; apiUrl?: string; apiKey?: string; appid?: string },
 ): Promise<{
-  success: boolean; fast_batch: boolean; count: number
-  results: Array<{ success: boolean; filename: string; fields: FieldResult[]; ocr_count: number; timestamp: string; fastgpt_used: boolean; error: string | null }>
+  success: boolean; fast_batch: boolean; mode: string; count: number
+  results: Array<{ success: boolean; filename: string; fields: FieldResult[]; ocr_count: number; timestamp: string; mode?: string; fastgpt_used: boolean; error: string | null }>
 }> {
   const form = new FormData()
   for (const f of files) form.append('files', f)
   form.append('use_fastgpt', String(opts?.useFastgpt ?? false))
-  form.append('fast_batch', String(opts?.fastBatch ?? true))
+  form.append('fast_batch', String(opts?.fastBatch ?? false))
+  form.append('mode', opts?.mode ?? 'slow')
   form.append('api_url',  opts?.apiUrl  ?? '')
   form.append('api_key',  opts?.apiKey  ?? '')
   form.append('appid',    opts?.appid   ?? '')
