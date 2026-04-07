@@ -1,12 +1,8 @@
 import axios from 'axios'
 
-// 开发时 Vite 代理 /api -> http://localhost:8000
-// 生产时同域部署，直接访问
+// 开发时 Vite 代理 /api -> 见 vite.config 的 target（.env.development 的 VITE_API_PORT）
+// 生产 / 打包：与页面同源，禁止写死 127.0.0.1:端口，否则端口与后端不一致时下载会 ERR_CONNECTION_REFUSED
 const BASE = '/api'
-
-// 与 vite 代理、server 端口一致（默认 8001，见 web-ui/.env.development 的 VITE_API_PORT）
-const API_PORT = import.meta.env.VITE_API_PORT || '8001'
-const DOWNLOAD_BASE = `http://127.0.0.1:${API_PORT}/api`
 
 export const api = axios.create({
   baseURL: BASE,
@@ -294,7 +290,8 @@ export async function listExportFiles(): Promise<{ files: ExportFile[] }> {
  * @param filename 后端 output 目录下的文件名
  */
 export function downloadExportFile(filename: string): void {
-  const url = `${DOWNLOAD_BASE}/export/download?filename=${encodeURIComponent(filename)}`
+  const path = `/api/export/download?filename=${encodeURIComponent(filename)}`
+  const url = new URL(path, window.location.origin).href
   const link = document.createElement('a')
   link.href = url
   link.download = filename

@@ -7,7 +7,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = ''       # 强制 CPU
 
 import glob, sys
 
-MODELS = r'C:\Users\Administrator\.paddlex\official_models'
+MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
 DET = os.path.join(MODELS, 'PP-OCRv5_server_det')
 REC = os.path.join(MODELS, 'PP-OCRv5_server_rec')
 ORI = os.path.join(MODELS, 'PP-LCNet_x1_0_textline_ori')

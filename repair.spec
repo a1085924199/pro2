@@ -6,10 +6,27 @@
 import os
 
 ANACONDA    = r'E:\Anaconda\Lib\site-packages'
+# pro2 虚拟环境（Python 3.10）：用于获取 api-ms-win-* / ucrt DLL，解决 Win7 兼容
+ANACONDA_PY3 = r'E:\Anaconda_envs\envs\pro2'
 PADDLE_LIBS = os.path.join(ANACONDA, 'paddle', 'libs')
 PYQT5_DIR   = os.path.join(ANACONDA, 'PyQt5')
 PADDLEOCR   = os.path.join(ANACONDA, 'paddleocr')
 PADDLEX     = os.path.join(ANACONDA, 'paddlex')
+
+# Windows API Set DLL（解决 Win7 兼容问题，见 web_repair.spec 说明）
+_api_dlls = []
+for _src_dir in [ANACONDA_PY3, os.path.join(ANACONDA_PY3, 'Library', 'bin')]:
+    if os.path.isdir(_src_dir):
+        for _dll in os.listdir(_src_dir):
+            if _dll.startswith('api-') and _dll.endswith('.dll'):
+                _api_dlls.append((os.path.join(_src_dir, _dll), '.'))
+
+_ucrt_dlls = []
+for _src_dir in [ANACONDA_PY3, os.path.join(ANACONDA_PY3, 'Library', 'bin')]:
+    if os.path.isdir(_src_dir):
+        for _dll in os.listdir(_src_dir):
+            if _dll.startswith('ucrtbase') or (_dll.startswith('vcruntime') and '140' in _dll):
+                _ucrt_dlls.append((os.path.join(_src_dir, _dll), '.'))
 
 a = Analysis(
     ['repair.py'],  # 入口；依赖 ocr_core.py + ui_window.py
@@ -17,15 +34,20 @@ a = Analysis(
         r'D:\Pyproject\pro2',   # ocr_core.py / ui_window.py 所在目录
         ANACONDA,
         PADDLE_LIBS,
+        ANACONDA_PY3,
     ],
     binaries=[
         (os.path.join(ANACONDA, 'paddle', 'libs'), '.'),
-    ],
+    ] + _api_dlls + _ucrt_dlls,
     datas=[
         # 源模块（拆分后需显式打包）
         ('ocr_core.py',  '.'),
-        ('ui_window.py', '.'),
-        # 本地模型目录
+        # 本地模型目录（离线部署必需）
+        # 包含：PP-OCRv5_server_det/rec（文本检测+识别）
+        #       PP-DocLayout_plus-L（版面分析）
+        #       PP-LCNet_x1_0_table_cls（表格分类）
+        #       PP-LCNet_x1_0_doc_ori / textline_ori（方向分类）
+        #       PP-DocBlockLayout / RT-DETR-L_wired_table_cell_det / PP-Chart2Table（表格识别）
         ('models', 'models'),
         # PaddleOCR 3.x 资源
         (os.path.join(PADDLEOCR, '_pipelines'), 'paddleocr/_pipelines'),
@@ -56,8 +78,6 @@ a = Analysis(
         'PIL', 'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageFont',
         'skimage', 'skimage.io', 'skimage.transform',
         'shapely', 'shapely.geometry', 'pyclipper', 'lmdb', 'rapidfuzz',
-        # PyQt5
-        'PyQt5', 'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets', 'PyQt5.sip',
         # 工具库
         'yaml', 'requests', 'requests.adapters',
         'openpyxl', 'openpyxl.styles', 'openpyxl.worksheet',
@@ -87,7 +107,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,   # GUI模式，不显示控制台
+    console=True,   # GUI模式
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

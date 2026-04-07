@@ -46,6 +46,7 @@ def _log(msg: str, flush: bool = True):
     sys.stdout.flush()
 
 os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
+os.environ.setdefault('PADDLE_PDX_MODEL_STORAGE_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'))
 
 try:
     from paddleocr import PPStructureV3, PaddleOCR
@@ -69,9 +70,55 @@ class OCRTask(str, Enum):
 # ============================================================================
 # 模型路径配置
 # ============================================================================
-PADDLEX_MODELS_DIR = r'C:\Users\Administrator\.paddlex\official_models'
+# 优先使用 MODEL_PATH 环境变量，否则使用项目本地的 models/ 目录
+_BASE_MODEL_DIR = os.environ.get(
+    'MODEL_PATH',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'),
+)
+PADDLEX_MODELS_DIR = _BASE_MODEL_DIR
 DET_MODEL_DIR      = os.path.join(PADDLEX_MODELS_DIR, 'PP-OCRv5_server_det')
 REC_MODEL_DIR      = os.path.join(PADDLEX_MODELS_DIR, 'PP-OCRv5_server_rec')
+# 版面分析 + 表格识别模型（PPStructureV3 启动时按需加载）
+DOC_LAYOUT_DIR     = os.path.join(PADDLEX_MODELS_DIR, 'PP-DocLayout_plus-L')
+TABLE_CLS_DIR      = os.path.join(PADDLEX_MODELS_DIR, 'PP-LCNet_x1_0_table_cls')
+DOC_ORI_DIR        = os.path.join(PADDLEX_MODELS_DIR, 'PP-LCNet_x1_0_doc_ori')
+TEXTLINE_ORI_DIR   = os.path.join(PADDLEX_MODELS_DIR, 'PP-LCNet_x1_0_textline_ori')
+# 表格识别子模型（与 PPStructureV3 官方参数名一致：wired_/wireless_*）
+WIRED_TABLE_STRUCT_DIR    = os.path.join(PADDLEX_MODELS_DIR, 'SLANeXt_wired')
+WIRED_TABLE_STRUCT_NAME   = 'SLANeXt_wired'
+WIRELESS_TABLE_STRUCT_DIR = os.path.join(PADDLEX_MODELS_DIR, 'SLANet_plus')
+WIRELESS_TABLE_STRUCT_NAME = 'SLANet_plus'
+WIRED_TABLE_CELL_DIR      = os.path.join(PADDLEX_MODELS_DIR, 'RT-DETR-L_wired_table_cell_det')
+WIRED_TABLE_CELL_NAME     = 'RT-DETR-L_wired_table_cell_det'
+WIRELESS_TABLE_CELL_DIR   = os.path.join(PADDLEX_MODELS_DIR, 'RT-DETR-L_wireless_table_cell_det')
+WIRELESS_TABLE_CELL_NAME  = 'RT-DETR-L_wireless_table_cell_det'
+CHART_RECOG_DIR           = os.path.join(PADDLEX_MODELS_DIR, 'PP-Chart2Table')
+# 文档去扭曲（部分版本在 use_doc_unwarping=False 时仍会实例化，传本地路径避免走 C 盘缓存）
+DOC_UNWARP_DIR            = os.path.join(PADDLEX_MODELS_DIR, 'UVDoc')
+# 版面分析模型名（PPStructureV3 内部根据模型目录名推断，默认从官方缓存下载 DocBlockLayout）
+# 显式传入 name 使其跳过目录名校验，直接用 dir 指向本地路径
+DOC_LAYOUT_NAME          = 'PP-DocLayout_plus-L'
+# 图表识别模型名（chart_recognition_model_dir 指定后仍可能触发 PP-Chart2Table 内部子模型）
+CHART_RECOG_NAME         = 'PP-Chart2Table'
+
+# ============================================================================
+# 全局：强制 PaddleX 所有模型走项目本地目录，不从 C 盘官方缓存读取
+# ============================================================================
+os.environ.setdefault('PADDLE_PDX_MODEL_STORAGE_DIR', PADDLEX_MODELS_DIR)
+os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')  # 跳过联网校验
+
+# 完整模型列表（PP-StructureV3 正常模式需要）：
+#   PP-OCRv5_server_det/rec     - 文本检测+识别（必需）
+#   PP-DocLayout_plus-L          - 版面分析 layout_detection_model_dir（必需）
+#   PP-LCNet_x1_0_table_cls     - 表格分类（use_table_recognition=True 时需要）
+#   PP-LCNet_x1_0_doc_ori        - 文档方向分类（已禁用但建议传路径）
+#   PP-LCNet_x1_0_textline_ori  - 文本行方向分类（已禁用但建议传路径）
+#   SLANeXt_wired / SLANet_plus - wired_/wireless_table_structure_recognition_model_dir
+#   RT-DETR-L_*_table_cell_det  - wired_/wireless_table_cells_detection_model_dir
+#   PP-Chart2Table              - chart_recognition_model_dir（表格链路可能加载）
+#   UVDoc                       - doc_unwarping_model_dir（部分构建仍会创建）
+#
+# 已禁用的功能（use_*=False，尽量不加载）：公式、印章、图表识别开关等见下方初始化。
 
 # ============================================================================
 # PPStructureV3 主引擎池（单例，项目启动时预加载）
@@ -117,7 +164,7 @@ class PPStructureV3Pool:
                 # 尝试使用 GPU 加速，如果不可用则回退到 CPU
                 device = 'cpu'
                 cpu_threads = 8
-                enable_mkldnn = True
+                enable_mkldnn = False
                 try:
                     paddle.device.set_device('gpu')
                     device = 'gpu'
@@ -135,18 +182,39 @@ class PPStructureV3Pool:
                 _log('[PPStructureV3] 正在加载 PP-OCRv5 检测模型...')
                 t0 = time.time()
                 self._engine = PPStructureV3(
+                    # 版面 + 文本（官方参数名见 paddleocr.PPStructureV3.__init__）
+                    layout_detection_model_name=DOC_LAYOUT_NAME,
+                    layout_detection_model_dir=DOC_LAYOUT_DIR,
                     text_detection_model_dir=DET_MODEL_DIR,
                     text_recognition_model_dir=REC_MODEL_DIR,
-                    use_doc_orientation_classify=False,   # 关闭文档方向分类
-                    use_doc_unwarping=False,              # 关闭文档去扭曲
-                    use_table_recognition=True,           # 表格识别（调修单需要）
-                    use_textline_orientation=False,       # 关闭文本方向分类（调修单通常方向固定）
-                    use_seal_recognition=False,           # 关闭印章识别
-                    use_formula_recognition=False,         # 关闭公式识别
-                    use_chart_recognition=False,          # 关闭图表识别
-                    device=device,                        # gpu/cpu
-                    cpu_threads=cpu_threads,               # CPU 线程数
-                    enable_mkldnn=enable_mkldnn,        # 启用 MKL-DNN 加速
+                    table_classification_model_dir=TABLE_CLS_DIR,
+                    doc_orientation_classify_model_dir=DOC_ORI_DIR,  # 指向项目 models/PP-LCNet_x1_0_doc_ori，避免走 C 盘缓存
+                    table_orientation_classify_model_dir=DOC_ORI_DIR,
+                    textline_orientation_model_dir=TEXTLINE_ORI_DIR,   # 已禁用 use_textline_orientation=False，但 TableRecognition 子流水线内部会加载
+                    doc_unwarping_model_dir=None,          # 已禁用 use_doc_unwarping=False，None 避免懒加载
+                    # 表格：有线/无线结构识别 + 单元格检测 + 图表转表（均指向项目 models/）
+                    wired_table_structure_recognition_model_name=WIRED_TABLE_STRUCT_NAME,
+                    wired_table_structure_recognition_model_dir=WIRED_TABLE_STRUCT_DIR,
+                    wireless_table_structure_recognition_model_name=WIRELESS_TABLE_STRUCT_NAME,
+                    wireless_table_structure_recognition_model_dir=WIRELESS_TABLE_STRUCT_DIR,
+                    wired_table_cells_detection_model_name=WIRED_TABLE_CELL_NAME,
+                    wired_table_cells_detection_model_dir=WIRED_TABLE_CELL_DIR,
+                    wireless_table_cells_detection_model_name=WIRELESS_TABLE_CELL_NAME,
+                    wireless_table_cells_detection_model_dir=WIRELESS_TABLE_CELL_DIR,
+                    chart_recognition_model_name=CHART_RECOG_NAME,
+                    chart_recognition_model_dir=CHART_RECOG_DIR,
+                    # 功能开关
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_table_recognition=True,
+                    use_textline_orientation=False,
+                    use_seal_recognition=False,
+                    use_formula_recognition=False,
+                    use_chart_recognition=False,
+                    use_region_detection=False,
+                    device=device,
+                    cpu_threads=cpu_threads,
+                    enable_mkldnn=enable_mkldnn,
                 )
                 _log(f'[PPStructureV3] ✓ 引擎初始化完成，耗时 {time.time()-t0:.1f}s')
                 self._ready = True
@@ -251,7 +319,7 @@ class PaddleOCREnginePool:
 
                 device = 'cpu'
                 cpu_threads = 8
-                enable_mkldnn = True
+                enable_mkldnn = False
                 try:
                     paddle.device.set_device('gpu')
                     device = 'gpu'
@@ -264,10 +332,16 @@ class PaddleOCREnginePool:
                 _log('[FastOCR] 正在加载 PP-OCRv5 检测模型...')
                 _log('[FastOCR] 正在加载 PP-OCRv5 识别模型...')
                 t0 = time.time()
+                # 设置本地模型存储目录，避免联网下载
+                os.environ.setdefault('PADDLE_PDX_MODEL_STORAGE_DIR', PADDLEX_MODELS_DIR)
                 self._engine = PaddleOCR(
+                    # 指定本地模型路径
                     det_model_dir=DET_MODEL_DIR,
                     rec_model_dir=REC_MODEL_DIR,
-                    use_angle_cls=False,          # 关闭角度分类
+                    # 禁用角度分类，避免加载额外模型
+                    use_angle_cls=False,
+                    # 注意：use_angle_cls 与 use_textline_orientation 互斥，不能同时设置
+                    use_doc_unwarping=False,
                     rec_batch_num=16,            # 批量识别
                     device=device,               # gpu/cpu
                     cpu_threads=cpu_threads,       # CPU 线程数
@@ -357,7 +431,7 @@ def run_ocr(image_path: str) -> List[Dict]:
     _log('[OCR] 正在进行文本识别...')
     t0 = time.time()
     try:
-        results = list(engine.predict(img_bgr, use_table_recognition=False))
+        results = list(engine.predict(img_bgr, use_table_recognition=True, use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False))
     except TypeError:
         results = list(engine.predict(img_bgr))
     _log(f'[OCR] 文本识别完成，耗时 {time.time()-t0:.1f}s')

@@ -14,22 +14,25 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.units import pixels_to_points
 
 ORDER_KEY_COLS = ['装备型号', '器材名称', '器件编号', '型（图）号']
 CARD_KEY_COLS = ['产品代号', '返修件名称', '批次号', '图号']
 UNIFY = ['_k_model', '_k_name', '_k_batch', '_k_drawing']
 
+# 文字列在前，原图缩略图固定在最后两列，避免悬浮图遮挡中间调修单等字段
 ARCHIVE_HEADERS = [
     '返修卡号', '产品代号', '批次号', '返修件名称', '图号',
     '返修故障件信息', '损坏原因修理结果', 'FRACAS/排故报告编号',
-    '返修卡原图', '调修单号', '邮寄地址', '进厂时间', '调修单原图',
+    '调修单号', '邮寄地址', '进厂时间',
+    '返修卡原图', '调修单原图',
 ]
 
 # 批量导出模板中「原图」列（1-based）
 ORDER_IMG_COL = 10   # J
 CARD_IMG_COL = 14    # N
-# 档案表中嵌入列（1-based）
-ARCHIVE_CARD_IMG_COL = 9   # I
+# 档案表中缩略图列（1-based，置于最后两列）
+ARCHIVE_CARD_IMG_COL = 12   # L
 ARCHIVE_ORDER_IMG_COL = 13  # M
 
 
@@ -84,7 +87,16 @@ def _image_bytes_at(ws: Any, row_1based: int, col_1based: int) -> Optional[bytes
     return None
 
 
-def _thumb_png(data: bytes, max_w: int, max_h: int) -> Optional[bytes]:
+def _excel_column_width_px(width_chars: float) -> int:
+    """Excel 列宽（字符数）近似像素宽度（默认等宽假设，与 Excel 显示接近）。"""
+    w = max(float(width_chars), 0.0)
+    if w <= 0:
+        w = 8.43
+    return int((256 * w + int(128 / 7)) / 256) * 7
+
+
+def _thumb_png(data: bytes, max_w: int, max_h: int) -> Optional[Tuple[bytes, int, int]]:
+    """生成缩略 PNG，返回 (bytes, 宽, 高)；尺寸不超过 max_w×max_h。"""
     try:
         from PIL import Image as PILImage
         pil = PILImage.open(BytesIO(data))
@@ -97,7 +109,8 @@ def _thumb_png(data: bytes, max_w: int, max_h: int) -> Optional[bytes]:
         pil.thumbnail((max_w, max_h), resample)
         buf = BytesIO()
         pil.save(buf, format='PNG')
-        return buf.getvalue()
+        tw, th = pil.size
+        return buf.getvalue(), tw, th
     except Exception:
         return None
 
@@ -161,7 +174,8 @@ def build_repair_archive_xlsx(
         c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         c.border = border
 
-    widths = [12, 10, 12, 14, 14, 30, 30, 18, 16, 22, 28, 12, 16]
+    # 末两列为缩略图，加宽以容纳图；宽度与 _excel_column_width_px 一致用于控图
+    widths = [12, 10, 12, 14, 14, 30, 30, 18, 22, 28, 12, 36, 36]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -186,7 +200,7 @@ def build_repair_archive_xlsx(
                 cell.border = border
 
             for j, fn in enumerate(order_fields):
-                col = 10 + j
+                col = 9 + j
                 cell = ws.cell(row=row_idx, column=col, value=_cell_str(row.get(fn, '')))
                 cell.alignment = align
                 cell.border = border
@@ -196,31 +210,51 @@ def build_repair_archive_xlsx(
 
             ws.row_dimensions[row_idx].height = 28
 
+            def _col_px(col_1based: int) -> int:
+                letter = get_column_letter(col_1based)
+                wd = ws.column_dimensions[letter].width
+                if wd is None:
+                    wd = widths[col_1based - 1]
+                return max(48, _excel_column_width_px(float(wd)) - 10)
+
+            # 缩略图限制在对应列宽内，避免 oneCell 锚点图向右溢出遮挡左侧文字
+            max_w_c = _col_px(ARCHIVE_CARD_IMG_COL)
+            max_w_o = _col_px(ARCHIVE_ORDER_IMG_COL)
+            max_h_px = 300
+
+            img_heights: List[int] = []
+
             if rc is not None:
                 raw = _image_bytes_at(ws_c, rc, CARD_IMG_COL)
                 if raw:
-                    png = _thumb_png(raw, 480, 360)
-                    if png:
+                    tup = _thumb_png(raw, max_w_c, max_h_px)
+                    if tup:
+                        png, _pw, ph = tup
+                        img_heights.append(ph)
                         tp = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
                         tp.write(png)
                         tp.close()
                         temp_pngs.append(tp.name)
                         xl_img = XLImage(tp.name)
                         ws.add_image(xl_img, f'{get_column_letter(ARCHIVE_CARD_IMG_COL)}{row_idx}')
-                        ws.row_dimensions[row_idx].height = max(ws.row_dimensions[row_idx].height or 28, 200)
 
             if ro is not None:
                 raw = _image_bytes_at(ws_o, ro, ORDER_IMG_COL)
                 if raw:
-                    png = _thumb_png(raw, 520, 380)
-                    if png:
+                    tup = _thumb_png(raw, max_w_o, max_h_px)
+                    if tup:
+                        png, _pw, ph = tup
+                        img_heights.append(ph)
                         tp = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
                         tp.write(png)
                         tp.close()
                         temp_pngs.append(tp.name)
                         xl_img = XLImage(tp.name)
                         ws.add_image(xl_img, f'{get_column_letter(ARCHIVE_ORDER_IMG_COL)}{row_idx}')
-                        ws.row_dimensions[row_idx].height = max(ws.row_dimensions[row_idx].height or 28, 220)
+
+            if img_heights:
+                row_pt = max(28.0, float(pixels_to_points(max(img_heights) + 12)))
+                ws.row_dimensions[row_idx].height = min(row_pt, 320.0)
 
             row_idx += 1
 

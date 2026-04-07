@@ -614,7 +614,7 @@ export default function ReturnRepairPage() {
                     <b style={{ color: '#a8b0ba' }}>器件编号</b>↔批次号、<b style={{ color: '#a8b0ba' }}>型（图）号</b>↔图号。键值会自动去首尾空格并转为字符串比对。
                   </p>
                   <ul style={{ color: '#484f58', fontSize: 11, margin: 0, paddingLeft: 18 }}>
-                    <li>输出列：返修卡侧字段 + 调修单号 / 邮寄地址 / 进厂时间，以及两侧原图缩略图（返修卡原图、调修单原图）。</li>
+                    <li>输出列：返修卡侧字段 + 调修单号 / 邮寄地址 / 进厂时间；两侧原图缩略图固定在最后两列（返修卡原图、调修单原图），按列宽缩放，避免遮挡文字。</li>
                     <li>文件需与本系统批量导出模板列名一致（首个工作表）。</li>
                   </ul>
                 </div>
