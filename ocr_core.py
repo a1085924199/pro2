@@ -164,7 +164,7 @@ class PPStructureV3Pool:
                 # 尝试使用 GPU 加速，如果不可用则回退到 CPU
                 device = 'cpu'
                 cpu_threads = 8
-                enable_mkldnn = False
+                enable_mkldnn = True
                 try:
                     paddle.device.set_device('gpu')
                     device = 'gpu'
@@ -319,7 +319,7 @@ class PaddleOCREnginePool:
 
                 device = 'cpu'
                 cpu_threads = 8
-                enable_mkldnn = False
+                enable_mkldnn = True
                 try:
                     paddle.device.set_device('gpu')
                     device = 'gpu'

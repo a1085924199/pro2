@@ -1893,8 +1893,8 @@ async def export_list():
 
 if __name__ == "__main__":
     import uvicorn
-    # 8000 常被其它程序占用（Errno 10048）；默认 8001，可用环境变量 OCR_CHAIN_PORT 覆盖
-    port = int(os.environ.get("OCR_CHAIN_PORT", "8001"))
+    # 8000 常被其它程序占用（Errno 10048）；默认 1129，可用环境变量 OCR_CHAIN_PORT 覆盖
+    port = int(os.environ.get("OCR_CHAIN_PORT", "1129"))
     print(f"[OCR·CHAIN] 启动后端服务 http://localhost:{port}")
     print(f"[OCR·CHAIN] API 文档：http://localhost:{port}/docs")
     uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)

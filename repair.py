@@ -6,7 +6,7 @@ repair.py - 程序入口 v3.0
 
 运行方式：
   Web模式（默认）:  python repair.py
-                    启动 FastAPI 后端服务 http://localhost:8000
+                    启动 FastAPI 后端服务 http://localhost:1128
                     前端独立运行：cd web-ui && npm run dev
 
   CLI模式:          python repair.py --cli --image <图片路径>
@@ -20,7 +20,7 @@ from datetime import datetime
 os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
+def run_server(host: str = "0.0.0.0", port: int = 1129, reload: bool = False):
     """启动 FastAPI 后端服务"""
     try:
         import uvicorn
@@ -28,12 +28,18 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
         print("错误: 请先安装 uvicorn：pip install uvicorn[standard]")
         sys.exit(1)
 
+    # exe 环境下获取前端是否内置
+    bundled = not (getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'))
+
     print("=" * 55)
     print("  智·链 OCR 平台 后端服务")
     print(f"  后端接口：http://localhost:{port}")
     print(f"  API文档：http://localhost:{port}/docs")
-    print("  前端请在 web-ui 目录运行：npm run dev")
-    print("  前端地址：http://localhost:5173")
+    if bundled:
+        print(f"  前端地址：http://localhost:{port}/web-ui")
+    else:
+        print("  前端独立运行：cd web-ui && npm run dev")
+        print("  前端地址：http://localhost:5173")
     print("=" * 55)
 
     uvicorn.run(
@@ -85,7 +91,7 @@ def main():
     parser.add_argument("--api-key",  type=str, default="", help="FastGPT API密钥")
     parser.add_argument("--appid",    type=str, default="", help="FastGPT 应用ID")
     parser.add_argument("--host",     type=str, default="0.0.0.0", help="服务监听地址")
-    parser.add_argument("--port",     type=int, default=8000,      help="服务监听端口")
+    parser.add_argument("--port",     type=int, default=1128,      help="服务监听端口")
     parser.add_argument("--reload",   action="store_true", help="开启热重载（开发模式）")
     args = parser.parse_args()
 
