@@ -29,7 +29,18 @@ import requests
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
+try:
+    import zoneinfo
+except ImportError:
+    # 在Python 3.8中缺少zoneinfo模块，尝试使用backports.zoneinfo
+    try:
+        import backports.zoneinfo
+        import sys
+        sys.modules['zoneinfo'] = backports.zoneinfo
+        print("已使用backports.zoneinfo替代zoneinfo模块")
+    except ImportError:
+        print("警告: 缺少zoneinfo模块，可能会影响PaddleOCR的某些功能")
 
 # Windows 控制台强制 UTF-8 输出（chcp 65001 的等效 Python 设置）
 try:
@@ -438,7 +449,7 @@ def run_ocr(image_path: str) -> List[Dict]:
     return _extract_texts_from_results(results)
 
 
-def _extract_texts_from_results(results: list) -> List[Dict]:
+def _extract_texts_from_results(results: List) -> List[Dict]:
     """
     从 PPStructureV3 的 Result 对象列表中提取文本信息。
     返回统一格式的文本框列表：[{text, confidence, bbox, poly, type}]
@@ -955,7 +966,7 @@ class RepairCardParser(DocParser):
         return t.strip()
 
     @staticmethod
-    def _regex_extract_fault_and_damage(s: str) -> tuple[str, str]:
+    def _regex_extract_fault_and_damage(s: str) -> Tuple[str, str]:
         """
         按标签从全文或单单元格文本中拆分两段。
         返修故障件信息：……（至「损坏原因」标签前）
@@ -988,9 +999,9 @@ class RepairCardParser(DocParser):
         return fault, damage
 
     @staticmethod
-    def _collect_table_text_blobs(table_regions) -> list[str]:
+    def _collect_table_text_blobs(table_regions) -> List[str]:
         """所有表格单元格文本，用于分段识别（多格拆行时拼接）。"""
-        blobs: list[str] = []
+        blobs: List[str] = []
         for tr in (table_regions or []):
             for cell in tr.get('cells', []):
                 ct = (cell.get('text') or '').strip()
@@ -2137,4 +2148,5 @@ class TableExporter:
             return output_path
         except Exception as e:
             print(f"[WARN] 导出Markdown失败: {e}")
+
             return ""

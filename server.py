@@ -155,8 +155,8 @@ REPAIR_CARD_EXPORT_FIELDS = [
 ]
 
 
-def _repair_order_field_map(fields_list: list) -> dict[str, str]:
-    m: dict[str, str] = {}
+def _repair_order_field_map(fields_list: List[dict]) -> Dict[str, str]:
+    m: Dict[str, str] = {}
     for item in fields_list:
         f = item.get('field', '')
         v = item.get('value', '')
@@ -165,8 +165,8 @@ def _repair_order_field_map(fields_list: list) -> dict[str, str]:
     return m
 
 
-def _repair_card_field_map(fields_list: list) -> dict[str, str]:
-    m: dict[str, str] = {}
+def _repair_card_field_map(fields_list: List[dict]) -> Dict[str, str]:
+    m: Dict[str, str] = {}
     for item in fields_list:
         f = item.get('field', '')
         v = item.get('value', '')
@@ -177,7 +177,7 @@ def _repair_card_field_map(fields_list: list) -> dict[str, str]:
 
 def _write_repair_order_excel_template(
     path: str,
-    field_map: dict[str, str],
+    field_map: Dict[str, str],
     image_name: str,
     recognition_time: str,
     image_bytes: Optional[bytes],
@@ -262,7 +262,7 @@ def _write_repair_order_excel_template(
 
 def _write_repair_card_excel_template(
     path: str,
-    field_map: dict[str, str],
+    field_map: Dict[str, str],
     image_name: str,
     recognition_time: str,
     image_bytes: Optional[bytes],
@@ -533,7 +533,7 @@ def _write_repair_card_excel_batch(path: str, rows: List[dict]) -> None:
 def _field_result(fields: dict, ocr_results: list) -> dict:
     """将提取字段转换为前端 ResultTable 需要的格式"""
     # 计算每个字段值的置信度（取对应 OCR 文本的最大置信度）
-    text_conf: dict[str, float] = {}
+    text_conf: Dict[str, float] = {}
     for item in ocr_results:
         text_conf[item["text"]] = max(text_conf.get(item["text"], 0.0), item["confidence"])
 
@@ -1049,7 +1049,7 @@ async def export_repair_order(
         _log(f'解析到 {len(fields_list)} 个字段')
 
         base_name = f"调修单_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        exports: dict[str, str] = {}
+        exports: Dict[str, str] = {}
 
         if doc_type == 'repair_order':
             field_map = _repair_order_field_map(fields_list)
@@ -1234,7 +1234,7 @@ async def export_repair_batch(
     while len(img_bytes_list) < len(rows_in):
         img_bytes_list.append(None)
 
-    exports: dict[str, str] = {}
+    exports: Dict[str, str] = {}
     ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     base = f"调修单批量_{ts}" if doc_type == 'repair_order' else f"返修卡批量_{ts}"
 
@@ -1576,7 +1576,7 @@ async def ocr_material(
         else:
             TARGET = ['入库单号', '航材名称', '航材型号', '数量', '入库日期', '经手人', '供应商', '备注']
 
-        fields: dict[str, str] = {f: "" for f in TARGET}
+        fields: Dict[str, str] = {f: "" for f in TARGET}
         for item in ocr_results:
             text = item["text"]
             for f in TARGET:
